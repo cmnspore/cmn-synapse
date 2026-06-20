@@ -2,7 +2,7 @@
   "$schema": "https://cmn.dev/schemas/v1/spore-core.json",
   "id": "cmn-synapse",
   "name": "CMN Synapse",
-  "version": "0.2.0",
+  "version": "0.1.0",
   "domain": "cmn.dev",
   "key": "ed25519.7BmCWmBb2YeUWR7pmHvwAvi9wRm96VpZsJvZFSTfc2Uu",
   "synopsis": "The reference CMN indexer — ingests signed manifests, indexes spores and myceliums, serves discovery queries, and syncs across instances via Nostr.",

@@ -770,7 +770,7 @@ dependencies = [
 
 [[package]]
 name = "cmn-synapse"
-version = "0.2.0"
+version = "0.1.0"
 dependencies = [
  "agent-first-data",
  "anyhow",

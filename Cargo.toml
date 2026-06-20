@@ -1,6 +1,6 @@
 [package]
 name = "cmn-synapse"
-version = "0.2.0"
+version = "0.1.0"
 edition = "2021"
 description = "CMN federated indexer — pulse ingestion, domain crawling, Nostr relay sync, lineage traversal, and semantic search"
 license = "MIT"
