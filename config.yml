@@ -1,0 +1,140 @@
+# Synapse Configuration
+#
+# The CMN Federated Indexer and Resilience Layer
+#
+# Deployment options:
+# 1. Development: HTTP only (https.enabled=false), h2c support
+# 2. Production standalone: HTTPS with ACME (https.enabled=true)
+# 3. Production with Caddy: HTTP only behind Caddy reverse proxy
+
+# Debug mode
+# true: verbose logging, self-signed certs allowed
+# false: production settings
+debug: true
+
+# Log output format
+# json: structured JSON logs (recommended for production)
+# plain: human-readable plain text logs
+log_format: "json"
+
+# Service bonds declared by this node (exposed via GET /health)
+bonds: []
+
+# Storage backend configuration
+storage:
+  # Backend: "postgres" or "redb"
+  backend: "redb"
+
+  # PostgreSQL connection URL (required if backend is "postgres")
+  # postgres_url_secret: "postgres://localhost/synapse"
+
+  # Redb file path (required if backend is "redb")
+  redb_path: "synapse.db"
+
+# Cache TTL (seconds)
+cache:
+  cmn_ttl_s: 300     # cmn.json (5 minutes)
+
+# Pulse processing
+pulse:
+  max_clock_skew_s: 300    # Maximum allowed clock skew (5 minutes)
+  max_body_bytes: 1048576  # Maximum request body size (1 MB)
+
+# Rate limiting
+rate_limit:
+  max_concurrent_requests: 50  # 0 = unlimited
+
+# Retry strategy for failed mycelium syncs (exponential backoff)
+retry:
+  base_interval_s: 60      # Initial retry interval
+  max_interval_s: 3600     # Maximum backoff ceiling (1 hour)
+  backoff_multiplier: 2.0  # Multiply interval by this on each failure
+
+# HTTP server with h2c support (HTTP/2 cleartext)
+# When https.enabled=false, this serves the API with h2c support
+# When https.enabled=true, this only redirects to HTTPS
+http:
+  enabled: true
+  # Listen address
+  # Development: 0.0.0.0:3000 or [::]:3000
+  # Production behind Caddy: 127.0.0.1:3000
+  address: "0.0.0.0:3000"
+
+# HTTPS server (optional)
+# Enable for standalone deployment with automatic certificate management
+# Disable when using Caddy as reverse proxy (Caddy handles TLS)
+https:
+  enabled: false
+  # Listen address
+  # Development: 0.0.0.0:3443
+  # Production standalone: [::]:443
+  address: "0.0.0.0:3443"
+
+  # Self-signed certificate validity (days)
+  self_signed_validity_days: 365
+
+  # ACME configuration (Let's Encrypt)
+  acme:
+    # Contact email for Let's Encrypt notifications
+    contact: "admin@example.com"
+    # Certificate mode:
+    # self: auto-generate self-signed (development)
+    # staging: Let's Encrypt staging (testing, rate limits relaxed)
+    # production: Let's Encrypt production (real certificates)
+    mode: "self"
+    # Renew certificates this many days before expiry
+    renewal_before_days: 30
+
+  # Domain names for certificate
+  # Leave empty to use "localhost" (development)
+  domains: []
+  # Production example:
+  # domains:
+  #   - "synapse.example.com"
+
+# Lineage / ancestry BFS traversal limits
+lineage:
+  max_depth: 50  # Server-side cap on max_depth query parameter
+
+# Search engine (requires "ruvector" feature + external embedding service)
+# search:
+#   enabled: false
+#   index_path: "synapse-search"
+#   embedding:
+#     provider: "ollama"
+#     url: "http://localhost:11434"
+#     model: "nomic-embed-text"
+#     dimensions: 768
+#   graph:
+#     enabled: false               # In-memory spore evolution graph
+#     rebuild_on_startup: true      # Rebuild from storage on boot
+#     embed_relationships: false    # Embed edge descriptions (costs API calls)
+#     rebuild_batch_size: 100
+
+# Nostr integration (requires "nostr" feature)
+# Synapse can act as both a Nostr client and a CMN-only Nostr relay.
+nostr:
+  enabled: true
+
+  # External Nostr relay URLs to connect to
+  relays:
+    - "wss://relay.damus.io"
+    - "wss://nos.lol"
+
+  # Where to persist the Nostr identity key (secp256k1 nsec).
+  # "storage"       — store in the configured database (default)
+  # "file:<path>"   — store as a plain file (chmod 0600)
+  # Auto-generated on first run if no key exists.
+  key_store: "storage"
+
+  # Subscribe to external relays for incoming CMN events
+  subscribe: true
+
+  # Forward HTTP pulses to Nostr relays
+  forward_pulse: true
+
+  # Maximum Nostr events kept in memory (oldest evicted first)
+  max_events: 10000
+
+  # Maximum WebSocket message size in bytes (256 KB)
+  max_ws_message_bytes: 262144

@@ -1,0 +1,74 @@
+{
+  "$schema": "https://cmn.dev/schemas/v1/spore-core.json",
+  "id": "cmn-synapse",
+  "name": "CMN Synapse",
+  "version": "0.2.0",
+  "domain": "cmn.dev",
+  "key": "ed25519.7BmCWmBb2YeUWR7pmHvwAvi9wRm96VpZsJvZFSTfc2Uu",
+  "synopsis": "The reference CMN indexer — ingests signed manifests, indexes spores and myceliums, serves discovery queries, and syncs across instances via Nostr.",
+  "intent": [
+    "Deliver a federated indexer implementing the Synapse protocol with verifiable ingestion and synchronization: HTTP/HTTPS serving, certificate automation, signed pulse processing, background crawling, relay-based cross-instance sync, and optional vector/graph query acceleration",
+    "Enable decentralized spore discovery — anyone can run a Synapse instance, index spores from any domain, and be queried by hypha or any CMN-aware agent"
+  ],
+  "license": "MIT",
+  "mutations": [
+    "Extract a unified ingest pipeline into a dedicated ingest.rs module, replacing the previous ad-hoc pulse handling scattered across handlers",
+    "Add cmn.json entry cache (CmnCache) to reduce redundant fetches during crawling and pulse ingestion — domains are cached for a configurable TTL",
+    "Delegate all signature verification to substrate (verify_signatures / verify_self_hosted_signatures), removing duplicated crypto logic from the crawler and handlers",
+    "Add strain filter parameter to GET /synapse/search — clients can now filter results to spores that follow a specific strain ID",
+    "Add clock skew validation for ingested and crawled mycelium — rejects data with timestamps more than max_clock_skew_s seconds in the future",
+    "Crawler now skips mycelium updates that are not strictly newer than the cached version, preventing replay and rollback attacks",
+    "Extend SSRF protection to cover IPv4-mapped IPv6 addresses (::ffff:0:0/96) via substrate::is_public_ip, closing a bypass in dns_filter",
+    "Support multi-shard mycelium: crawler fetches and merges overflow shards, tracking all hashes as a composite key",
+    "Spawn graph relationship indexing in a background task to avoid blocking the crawl loop when the embedding API is slow",
+    "Rename response field cmn → cmn_entry in GET /synapse/mycelium/:domain to avoid ambiguity with the taste endpoint's cmn field"
+  ],
+  "bonds": [
+    {
+      "relation": "follows",
+      "uri": "cmn://cmn.dev/b3.663dKNmX8HP8T4WWQudXe9Eo4cNedjJJzRjqVSg5KwB4",
+      "id": "strain-service",
+      "reason": "Deployed HTTP service — declares base URLs in service.json and provides GET /health"
+    },
+    {
+      "relation": "follows",
+      "uri": "cmn://cmn.dev/b3.BcbTSu1t1bwY2GQG8tXeFXyykZFj7E1HL2eWVw189cmo",
+      "id": "strain-synapse",
+      "reason": "Implements the Synapse protocol — pulse ingestion, spore retrieval, lineage traversal, mycelium listing"
+    },
+    {
+      "relation": "follows",
+      "uri": "cmn://cmn.dev/b3.CcKCjWncc7gbttaxW6hsPtRfiqCSV3L4TQoeqDnbLV5w",
+      "id": "strain-synapse-search",
+      "reason": "Implements full-text search across indexed spores when search feature is enabled"
+    },
+    {
+      "relation": "follows",
+      "uri": "cmn://cmn.dev/b3.2gGZUjez9iZTN6FsrF7h7Z8kd2QuUFALqafZf8r1Szwt",
+      "id": "strain-synapse-nostr",
+      "reason": "Implements Nostr relay and pulse forwarding when nostr feature is enabled"
+    },
+    {
+      "relation": "depends_on",
+      "uri": "cmn://agentfirstkit.com/b3.39kCSa6orKxAaLcSGpisgLo3KXCxzCw2KutvdhgajCV3",
+      "id": "agent-first-data",
+      "reason": "All API response fields and log events use Agent-First Data suffix conventions"
+    },
+    {
+      "relation": "depends_on",
+      "uri": "cmn://cmn.dev/b3.4nPCXoZt5JhiG7BfwbpcvRoj1C68qz6UmqJd2h7CAiv3",
+      "id": "cmn-spec",
+      "reason": "Implements the CMN protocol specification — reference Synapse indexer"
+    }
+  ],
+  "tree": {
+    "algorithm": "blob_tree_blake3_nfc",
+    "exclude_names": [
+      ".git",
+      ".cmn"
+    ],
+    "follow_rules": [
+      ".gitignore"
+    ]
+  }
+}
