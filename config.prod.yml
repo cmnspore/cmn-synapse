@@ -1,0 +1,111 @@
+# Synapse Configuration (Production with Caddy)
+#
+# The CMN Federated Indexer and Resilience Layer
+#
+# Production mode: Caddy handles TLS, HTTP/3, auto HTTPS
+# Synapse runs behind Caddy, receives h2c (HTTP/2 cleartext)
+
+# Debug mode
+# true: self-signed certs, verbose logging
+# false: production settings
+debug: false
+
+# Log output format
+# json: structured JSON logs (default, recommended for production)
+# plain: human-readable plain text logs
+log_format: "json"
+
+# Storage backend configuration
+storage:
+  # Backend: "postgres" or "redb"
+  backend: "redb"
+
+  # PostgreSQL connection URL (required if backend is "postgres")
+  # postgres_url_secret: "postgres://localhost/synapse"
+
+  # Redb file path (required if backend is "redb")
+  redb_path: "synapse.db"
+
+# Cache TTL (seconds)
+cache:
+  cmn_ttl_s: 300     # cmn.json (5 minutes)
+
+# Pulse processing
+pulse:
+  max_clock_skew_s: 300  # Maximum allowed clock skew (5 minutes)
+
+# HTTP server with h2c support (HTTP/2 cleartext)
+# Caddy forwards all traffic here
+http:
+  enabled: true
+  # Only listen on localhost (Caddy is the public-facing server)
+  address: "127.0.0.1:3000"
+
+# HTTPS server (optional)
+# Enable for standalone deployment with automatic certificate management
+# Disable when using Caddy as reverse proxy (Caddy handles TLS)
+https:
+  enabled: false
+  # Listen address
+  # Development: 0.0.0.0:3443
+  # Production standalone: [::]:443
+  address: "0.0.0.0:3443"
+
+  # Self-signed certificate validity (days)
+  self_signed_validity_days: 365
+
+  # ACME configuration (Let's Encrypt)
+  acme:
+    # Contact email for Let's Encrypt notifications
+    contact: "admin@example.com"
+    # Certificate mode:
+    # self: auto-generate self-signed (development)
+    # staging: Let's Encrypt staging (testing, rate limits relaxed)
+    # production: Let's Encrypt production (real certificates)
+    mode: "self"
+    # Renew certificates this many days before expiry
+    renewal_before_days: 30
+
+  # Domain names for certificate
+  # Leave empty to use "localhost" (development)
+  domains: []
+  # Production example:
+  # domains:
+  #   - "synapse.example.com"
+
+# Search engine (requires "ruvector" feature + external embedding service)
+# search:
+#   enabled: false
+#   index_path: "synapse-search"
+#   embedding:
+#     provider: "ollama"
+#     url: "http://localhost:11434"
+#     model: "nomic-embed-text"
+#     dimensions: 768
+#   graph:
+#     enabled: false               # In-memory spore evolution graph
+#     rebuild_on_startup: true      # Rebuild from storage on boot
+#     embed_relationships: false    # Embed edge descriptions (costs API calls)
+#     rebuild_batch_size: 100
+
+# Nostr integration (requires "nostr" feature)
+# Synapse can act as both a Nostr client and a CMN-only Nostr relay.
+nostr:
+  enabled: true
+
+  # External Nostr relay URLs to connect to
+  relays:
+    - "wss://relay.damus.io"
+    - "wss://nos.lol"
+
+  # Where to persist the Nostr identity key (secp256k1 nsec).
+  # "storage"       — store in the configured database (default)
+  # "file:<path>"   — store as a plain file (chmod 0600)
+  # Auto-generated on first run if no key exists.
+  key_store: "storage"
+
+  # Subscribe to external relays for incoming CMN events
+  subscribe: true
+
+  # Forward HTTP pulses to Nostr relays
+  forward_pulse: true
