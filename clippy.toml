@@ -1,9 +1,13 @@
-# Canonical clippy config for every Rust spore in this repo. Every binary
-# spore is an Agent-First Data emitter — including cmn-tendril, whose
-# desktop GUI emits AFD JSONL on stdout alongside hypha, synapse, etc.
+# Canonical Clippy config for every Rust spore in this repository.
 #
-# Source of truth — `sync-clippy.sh` mirrors this file into each spore's
-# clippy.toml. Edit this file, then `bash scripts/sync-clippy.sh`.
+# Default policy mirrored into each Rust project's clippy.toml. Repository
+# tooling may select a project-specific full replacement.
+
+# Production code uses the matching `deny` lint levels in each Cargo.toml.
+# Tests may use these failure helpers when they make assertions clearer.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
 
 disallowed-macros = [
   { path = "std::eprintln", reason = "Agent-First Data convention requires structured events on stdout only; stderr is not a protocol channel." },

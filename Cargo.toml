@@ -1,8 +1,8 @@
 [package]
 name = "cmn-synapse"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "CMN federated indexer — pulse ingestion, domain crawling, Nostr relay sync, lineage traversal, and semantic search"
+description = "The reference CMN indexer — ingests signed manifests, indexes spores and myceliums, serves discovery queries, and syncs across instances via Nostr."
 license = "MIT"
 repository = "https://github.com/cmnspore/cmn-synapse"
 readme = "README.md"
@@ -29,10 +29,10 @@ ruvector = ["dep:ruvector-core"]
 cmn-substrate = { version = "0.3", features = ["client-safe-dns"] }
 
 # Agent-First Data tracing
-agent-first-data = { version = "0.14", features = ["tracing"] }
+agent-first-data = "0.22.0"
 
 # async runtime
-tokio = { version = "1.52", features = ["full"] }
+tokio = { version = "1.53", features = ["full"] }
 
 # http server
 axum = { version = "0.8", features = ["macros", "ws"] }
@@ -52,7 +52,7 @@ serde_jcs = "0.2"
 config = "0.15"
 
 # crypto
-ed25519-dalek = "2.2"
+ed25519-dalek = "3.0"
 hex = "0.4"
 
 # http client
@@ -68,7 +68,7 @@ clap = { version = "4", features = ["derive"] }
 # tls
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = "0.26"
-rustls-pemfile = "2"
+rustls-pki-types = { version = "1.15", features = ["std"] }
 
 # acme (let's encrypt)
 tokio-rustls-acme = { version = "0.9", features = ["axum"] }
@@ -81,7 +81,7 @@ x509-parser = "0.18"
 nostr-sdk = { version = "0.44", optional = true }
 
 # search
-ruvector-core = { version = "2.2", optional = true }
+ruvector-core = { version = "2.3", default-features = false, features = ["storage"], optional = true }
 
 # encoding
 base64 = "0.22"
@@ -95,7 +95,7 @@ serde_yaml = "0.9"
 [dev-dependencies]
 tempfile = "3.27"
 bs58 = "0.5"
-tokio-tungstenite = "0.29.0"
+tokio-tungstenite = "0.30.0"
 urlencoding = "2"
 wiremock = "0.6"
 serial_test = "3"

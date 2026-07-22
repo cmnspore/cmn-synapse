@@ -126,10 +126,16 @@ async fn test_get_spore_not_found() {
         .await
         .unwrap();
     let json: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_eq!(json["code"], "not_found");
     assert!(
-        json["hint"].as_str().is_some_and(|h| !h.is_empty()),
+        agent_first_data::validate_protocol_event(&json, true).is_ok(),
+        "error response must be strict AFDATA: {json}"
+    );
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(json["error"]["code"], "not_found");
+    assert!(
+        json["error"]["hint"]
+            .as_str()
+            .is_some_and(|h| !h.is_empty()),
         "error response should include hint: {:?}",
         json
     );
@@ -850,7 +856,7 @@ mod pulse_tests {
         let json: Value = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(status, StatusCode::OK, "Response: {:?}", json);
-        assert_eq!(json["code"], "ok", "Response: {:?}", json);
+        assert_eq!(json["kind"], "result", "Response: {:?}", json);
     }
 
     #[tokio::test]
@@ -890,7 +896,7 @@ mod pulse_tests {
         let json: Value = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(status, StatusCode::OK, "Response: {:?}", json);
-        assert_eq!(json["code"], "ok", "Response: {:?}", json);
+        assert_eq!(json["kind"], "result", "Response: {:?}", json);
     }
 
     #[tokio::test]
@@ -936,7 +942,11 @@ mod pulse_tests {
             "Response: {:?}",
             json
         );
-        assert_eq!(json["code"], "invalid_signature", "Response: {:?}", json);
+        assert_eq!(
+            json["error"]["code"], "invalid_signature",
+            "Response: {:?}",
+            json
+        );
     }
 
     #[tokio::test]
@@ -967,9 +977,15 @@ mod pulse_tests {
         let json: Value = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(status, StatusCode::BAD_REQUEST, "Response: {:?}", json);
-        assert_eq!(json["code"], "invalid_capsule", "Response: {:?}", json);
+        assert_eq!(
+            json["error"]["code"], "invalid_capsule",
+            "Response: {:?}",
+            json
+        );
         assert!(
-            json["hint"].as_str().is_some_and(|h| !h.is_empty()),
+            json["error"]["hint"]
+                .as_str()
+                .is_some_and(|h| !h.is_empty()),
             "Response: {:?}",
             json
         );
@@ -1003,9 +1019,15 @@ mod pulse_tests {
         let json: Value = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(status, StatusCode::BAD_REQUEST, "Response: {:?}", json);
-        assert_eq!(json["code"], "invalid_capsule", "Response: {:?}", json);
+        assert_eq!(
+            json["error"]["code"], "invalid_capsule",
+            "Response: {:?}",
+            json
+        );
         assert!(
-            json["hint"].as_str().is_some_and(|h| !h.is_empty()),
+            json["error"]["hint"]
+                .as_str()
+                .is_some_and(|h| !h.is_empty()),
             "Response: {:?}",
             json
         );
@@ -1103,7 +1125,11 @@ mod pulse_tests {
             "Response: {:?}",
             json
         );
-        assert_eq!(json["code"], "timestamp_future", "Response: {:?}", json);
+        assert_eq!(
+            json["error"]["code"], "timestamp_future",
+            "Response: {:?}",
+            json
+        );
     }
 
     #[tokio::test]
@@ -1143,7 +1169,7 @@ mod pulse_tests {
 
         // Should be accepted (200 OK), not rejected for clock skew
         assert_eq!(status, StatusCode::OK, "Response: {:?}", json);
-        assert_eq!(json["code"], "ok", "Response: {:?}", json);
+        assert_eq!(json["kind"], "result", "Response: {:?}", json);
     }
 
     #[tokio::test]
@@ -1203,7 +1229,11 @@ mod pulse_tests {
             .unwrap();
         let json2: Value = serde_json::from_slice(&body2).unwrap();
         assert_eq!(status2, StatusCode::CONFLICT, "Response: {:?}", json2);
-        assert_eq!(json2["code"], "version_not_newer", "Response: {:?}", json2);
+        assert_eq!(
+            json2["error"]["code"], "version_not_newer",
+            "Response: {:?}",
+            json2
+        );
     }
 
     #[tokio::test]
@@ -1264,6 +1294,10 @@ mod pulse_tests {
             .unwrap();
         let json2: Value = serde_json::from_slice(&body2).unwrap();
         assert_eq!(status2, StatusCode::CONFLICT, "Response: {:?}", json2);
-        assert_eq!(json2["code"], "version_not_newer", "Response: {:?}", json2);
+        assert_eq!(
+            json2["error"]["code"], "version_not_newer",
+            "Response: {:?}",
+            json2
+        );
     }
 }

@@ -8,9 +8,8 @@ use crate::config::AcmeConfig;
 use crate::storage::{Storage, StorageBackend};
 use chrono::{Duration, Utc};
 use rcgen::generate_simple_self_signed;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
-use std::io::BufReader;
+use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -78,16 +77,14 @@ pub fn parse_pem(
     (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>),
     Box<dyn std::error::Error + Send + Sync>,
 > {
-    let cert_reader = &mut BufReader::new(cert_pem.as_bytes());
     let certs: Vec<CertificateDer<'static>> =
-        rustls_pemfile::certs(cert_reader).collect::<Result<Vec<_>, _>>()?;
+        CertificateDer::pem_slice_iter(cert_pem.as_bytes()).collect::<Result<Vec<_>, _>>()?;
 
     if certs.is_empty() {
         return Err("No certificates found in PEM".into());
     }
 
-    let key_reader = &mut BufReader::new(key_pem.as_bytes());
-    let key = rustls_pemfile::private_key(key_reader)?.ok_or("No private key found in PEM")?;
+    let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes())?;
 
     Ok((certs, key))
 }

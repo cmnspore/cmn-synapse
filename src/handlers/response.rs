@@ -37,6 +37,21 @@ impl IntoResponse for ApiResponse {
 /// Storage backend name for trace metadata. Set once at startup.
 static STORAGE_BACKEND: OnceLock<String> = OnceLock::new();
 
+fn event_value(result: Result<agent_first_data::Event, agent_first_data::BuildError>) -> Value {
+    match result {
+        Ok(event) => event.into_value(),
+        Err(err) => serde_json::json!({
+            "kind": "error",
+            "error": {
+                "code": "internal_error",
+                "message": err.to_string(),
+                "retryable": false,
+            },
+            "trace": {},
+        }),
+    }
+}
+
 /// Set the storage backend name for response traces. Call once at startup.
 pub fn set_storage_backend(backend: &str) {
     let _ = STORAGE_BACKEND.set(backend.to_string());
@@ -55,8 +70,8 @@ fn base_trace() -> serde_json::Map<String, Value> {
 /// Success with result only (trace contains base node state)
 pub fn success(result: Value) -> ApiResult {
     let trace = Value::Object(base_trace());
-    let mut resp = agent_first_data::build_json_ok(result, Some(trace));
-    agent_first_data::redact_secrets_in_place(&mut resp);
+    let event = agent_first_data::json_result(result).trace(trace).build();
+    let resp = agent_first_data::redacted_value(event.as_value());
     ApiResponse {
         status: StatusCode::OK,
         body: resp,
@@ -71,38 +86,32 @@ pub fn success_trace(result: Value, trace: Value) -> ApiResult {
             base.insert(k, v);
         }
     }
-    let mut resp = agent_first_data::build_json_ok(result, Some(Value::Object(base)));
-    agent_first_data::redact_secrets_in_place(&mut resp);
+    let event = agent_first_data::json_result(result)
+        .trace(Value::Object(base))
+        .build();
+    let resp = agent_first_data::redacted_value(event.as_value());
     ApiResponse {
         status: StatusCode::OK,
         body: resp,
     }
 }
 
-/// Error with code carried directly in `code` field per convention.
+/// Error encoded as an AFDATA protocol-v1 error event.
 pub fn error(status: StatusCode, code: &str, message: &str) -> ApiResult {
     error_hint(status, code, message, Some(default_error_hint(code)))
 }
 
 /// Like [`error`] but with an actionable hint for remediation.
 pub fn error_hint(status: StatusCode, code: &str, message: &str, hint: Option<&str>) -> ApiResult {
-    let mut obj = serde_json::Map::new();
-    obj.insert("code".into(), Value::String(code.to_string()));
-    obj.insert("error".into(), Value::String(message.to_string()));
-    obj.insert(
-        "hint".into(),
-        Value::String(
-            hint.filter(|h| !h.trim().is_empty())
-                .unwrap_or_else(|| default_error_hint(code))
-                .to_string(),
-        ),
-    );
-    let base = base_trace();
-    if !base.is_empty() {
-        obj.insert("trace".into(), Value::Object(base));
-    }
-    let mut resp = Value::Object(obj);
-    agent_first_data::redact_secrets_in_place(&mut resp);
+    let hint = hint
+        .filter(|hint| !hint.trim().is_empty())
+        .unwrap_or_else(|| default_error_hint(code));
+    let resp = agent_first_data::redacted_value(&event_value(
+        agent_first_data::json_error(code, message)
+            .hint(hint)
+            .trace(Value::Object(base_trace()))
+            .build(),
+    ));
     ApiResponse { status, body: resp }
 }
 

@@ -165,23 +165,16 @@ async fn access_log(
         }
     }
 
-    let mut log = agent_first_data::build_json("request", fields, Some(trace));
-    agent_first_data::redact_secrets_in_place(&mut log);
-
-    let log_format = state.config.log_format.as_str();
-
-    let formatted = match log_format {
-        "plain" => agent_first_data::output_plain(&log),
-        "yaml" => agent_first_data::output_yaml(&log),
-        _ => agent_first_data::output_json(&log),
+    let event = agent_first_data::json_log(fields).trace(trace).build();
+    let format = match state.config.log_format.as_str() {
+        "plain" => agent_first_data::OutputFormat::Plain,
+        "yaml" => agent_first_data::OutputFormat::Yaml,
+        _ => agent_first_data::OutputFormat::Json,
     };
 
-    {
-        use std::io::Write;
-        let mut out = std::io::stdout().lock();
-        let _ = out.write_all(formatted.as_bytes());
-        let _ = out.write_all(b"\n");
-    }
+    let stdout = std::io::stdout();
+    let mut emitter = agent_first_data::CliEmitter::new(stdout.lock(), format);
+    let _ = emitter.emit(event);
 
     res
 }

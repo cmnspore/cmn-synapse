@@ -14,7 +14,7 @@ mod search;
 mod storage;
 mod time;
 
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use std::net::SocketAddr;
 use std::sync::Arc;
 #[cfg(feature = "postgres")]
@@ -28,8 +28,12 @@ use tracing_subscriber::EnvFilter;
 use handlers::AppState;
 
 #[derive(Parser, Debug)]
-#[command(name = "synapse")]
-#[command(about = "Synapse - CMN Federated Indexer")]
+#[command(
+    name = "synapse",
+    version,
+    about = "Synapse - CMN Federated Indexer",
+    disable_help_subcommand = true
+)]
 struct Args {
     /// Configuration file path
     #[arg(long, default_value = "config.yml")]
@@ -40,34 +44,109 @@ struct Args {
     /// Stop the running synapse process before using this flag.
     #[arg(long)]
     rebuild_search: bool,
+
+    /// Redirect stdout to this file
+    #[arg(long, value_name = "PATH")]
+    stdout_file: Option<std::path::PathBuf>,
+
+    /// Redirect stderr to this file
+    #[arg(long, value_name = "PATH")]
+    stderr_file: Option<std::path::PathBuf>,
+}
+
+fn emit_cli_event(event: agent_first_data::Event) {
+    let stdout = std::io::stdout();
+    let mut emitter =
+        agent_first_data::CliEmitter::new(stdout.lock(), agent_first_data::OutputFormat::Json);
+    let _ = emitter.emit(event);
+}
+
+fn emit_cli_value(value: serde_json::Value) {
+    let stdout = std::io::stdout();
+    let mut emitter =
+        agent_first_data::CliEmitter::new(stdout.lock(), agent_first_data::OutputFormat::Json);
+    let _ = emitter.emit_validated_value(value);
+}
+
+fn write_stdout(text: &str) {
+    let mut stdout = std::io::stdout().lock();
+    let _ = std::io::Write::write_all(&mut stdout, text.as_bytes());
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Install ring as the default crypto provider for rustls
+    let raw: Vec<String> = std::env::args().collect();
+    let _stream_redirect =
+        match agent_first_data::stream_redirect::install_from_raw_args(raw.clone()) {
+            Ok(installed) => installed,
+            Err(err) => {
+                emit_cli_event(agent_first_data::build_cli_error(&err.to_string(), None));
+                std::process::exit(2);
+            }
+        };
+
+    let build = match env!("GIT_SHA") {
+        "unknown" => None,
+        sha => Some(sha),
+    };
+    match agent_first_data::cli_handle_version_or_continue(
+        &raw,
+        &Args::command(),
+        "synapse",
+        Some(env!("DISPLAY_NAME")),
+        env!("CARGO_PKG_VERSION"),
+        build,
+    ) {
+        Ok(Some(version)) => {
+            write_stdout(&version);
+            return Ok(());
+        }
+        Ok(None) => {}
+        Err(err) => {
+            emit_cli_event(err);
+            std::process::exit(2);
+        }
+    }
+
+    match agent_first_data::cli_handle_help_or_continue(
+        &raw,
+        &Args::command(),
+        &agent_first_data::HelpConfig::human_cli_default(),
+    ) {
+        Ok(Some(help)) => {
+            write_stdout(&help);
+            return Ok(());
+        }
+        Ok(None) => {}
+        Err(err) => {
+            emit_cli_value(err);
+            std::process::exit(2);
+        }
+    }
+
+    let args = Args::try_parse().unwrap_or_else(|e| {
+        if matches!(
+            e.kind(),
+            clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+        ) {
+            write_stdout(&e.to_string());
+            std::process::exit(0);
+        }
+        emit_cli_event(agent_first_data::build_cli_error(
+            &e.to_string(),
+            Some("run synapse --help and retry with a valid configuration path"),
+        ));
+        std::process::exit(2);
+    });
+    let _ = (&args.stdout_file, &args.stderr_file);
+
+    // Install ring as the default crypto provider for rustls.
     if rustls::crypto::ring::default_provider()
         .install_default()
         .is_err()
     {
         return Err("Failed to install ring crypto provider".into());
     }
-
-    // Parse CLI args
-    let args = Args::try_parse().unwrap_or_else(|e| {
-        if matches!(
-            e.kind(),
-            clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
-        ) {
-            e.exit();
-        }
-        let output = agent_first_data::output_json(&agent_first_data::build_cli_error(
-            &e.to_string(),
-            Some("run synapse --help and retry with a valid configuration path"),
-        ));
-        let _ = std::io::Write::write_all(&mut std::io::stdout(), output.as_bytes());
-        let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\n");
-        std::process::exit(2);
-    });
 
     // Load config
     let cfg = Arc::new(config::AppConfig::load(Some(&args.config))?);
@@ -89,10 +168,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Configure log output format (JSON by default for network services)
-    match cfg.log_format.as_str() {
-        "plain" => agent_first_data::afdata_tracing::init_plain(filter),
-        _ => agent_first_data::afdata_tracing::init_json(filter),
-    }
+    let log_format = match cfg.log_format.as_str() {
+        "plain" => agent_first_data::afdata_tracing::LogFormat::Plain,
+        "yaml" => agent_first_data::afdata_tracing::LogFormat::Yaml,
+        _ => agent_first_data::afdata_tracing::LogFormat::Json,
+    };
+    agent_first_data::afdata_tracing::try_init(
+        filter,
+        log_format,
+        agent_first_data::Redactor::new(),
+    )?;
 
     // Startup config as nested JSON — bypasses tracing (which can't nest).
     {
@@ -673,25 +758,19 @@ async fn mycelium_retry_loop(
 /// Emit startup config as a single nested-JSON line to stdout.
 /// Bypasses tracing because tracing flattens all fields (no nested objects/arrays).
 fn log_startup_config(raw_config: serde_json::Value, config_path: &str, log_format: &str) {
-    let mut obj = agent_first_data::build_json(
-        "log",
-        serde_json::json!({
-            "event": "startup",
-            "config": raw_config,
-            "args": {"config_path": config_path},
-            "env": {"RUST_LOG": std::env::var("RUST_LOG").ok()}
-        }),
-        None,
-    );
-    agent_first_data::redact_secrets_in_place(&mut obj);
-
-    let formatted = match log_format {
-        "plain" => agent_first_data::output_plain(&obj),
-        "yaml" => agent_first_data::output_yaml(&obj),
-        _ => agent_first_data::output_json(&obj),
+    let event = agent_first_data::json_log(serde_json::json!({
+        "event": "startup",
+        "config": raw_config,
+        "args": {"config_path": config_path},
+        "env": {"RUST_LOG": std::env::var("RUST_LOG").ok()}
+    }))
+    .build();
+    let format = match log_format {
+        "plain" => agent_first_data::OutputFormat::Plain,
+        "yaml" => agent_first_data::OutputFormat::Yaml,
+        _ => agent_first_data::OutputFormat::Json,
     };
-
-    let mut out = std::io::stdout().lock();
-    let _ = std::io::Write::write_all(&mut out, formatted.as_bytes());
-    let _ = std::io::Write::write_all(&mut out, b"\n");
+    let stdout = std::io::stdout();
+    let mut emitter = agent_first_data::CliEmitter::new(stdout.lock(), format);
+    let _ = emitter.emit(event);
 }

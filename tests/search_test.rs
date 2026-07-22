@@ -594,7 +594,7 @@ async fn test_http_search_endpoint() {
         .unwrap();
     let json: Value = serde_json::from_slice(&body).unwrap();
 
-    assert_eq!(json["code"], "ok");
+    assert_eq!(json["kind"], "result");
     assert_eq!(json["result"]["query"]["text"], "HTTP client");
     assert_eq!(json["result"]["query"]["limit"], 3);
 
@@ -679,7 +679,7 @@ async fn test_http_search_with_filters() {
         .unwrap();
     let json: Value = serde_json::from_slice(&body).unwrap();
 
-    assert_eq!(json["code"], "ok");
+    assert_eq!(json["kind"], "result");
     assert_eq!(json["result"]["query"]["domain"], "cmn.dev");
 
     let results = json["result"]["spores"].as_array().unwrap();
@@ -1121,7 +1121,7 @@ async fn test_http_search_with_bond_filter() {
         .unwrap();
     let json: Value = serde_json::from_slice(&body).unwrap();
 
-    assert_eq!(json["code"], "ok");
+    assert_eq!(json["kind"], "result");
 
     let results = json["result"]["spores"].as_array().unwrap();
     assert_eq!(

@@ -29,11 +29,16 @@ fn ollama_url() -> Option<String> {
 }
 
 fn log_skip(reason: &str) {
-    let line = agent_first_data::output_json(&agent_first_data::build_json(
-        "log",
-        serde_json::json!({"event": "skip", "reason": reason}),
-        None,
-    ));
+    let event = agent_first_data::json_log(serde_json::json!({
+        "event": "skip",
+        "reason": reason,
+    }))
+    .build();
+    let line = agent_first_data::render(
+        event.as_value(),
+        agent_first_data::OutputFormat::Json,
+        &agent_first_data::OutputOptions::default(),
+    );
     println!("{line}");
 }
 

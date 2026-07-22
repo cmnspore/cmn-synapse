@@ -83,7 +83,7 @@ impl NostrBridge {
             let client = Client::builder().signer(keys.clone()).build();
             for relay_url in &config.relays {
                 if let Err(e) = client.add_relay(relay_url).await {
-                    warn!(relay = %relay_url, error = %e, "Failed to add relay");
+                    warn!(relay_url = %relay_url, error = %e, "Failed to add relay");
                 }
             }
             client.connect().await;
@@ -344,7 +344,7 @@ impl NostrBridge {
 
         for relay_url in &self.relays {
             if let Err(e) = client.add_relay(relay_url).await {
-                warn!(relay = %relay_url, error = %e, "Failed to add relay for subscription");
+                warn!(relay_url = %relay_url, error = %e, "Failed to add relay for subscription");
             }
         }
         client.connect().await;
