@@ -40,23 +40,26 @@ cargo run
 Create `config.yml`:
 
 ```yaml
+debug: false
+log_format: json
+
 storage:
-  type: postgres
-  url: "postgresql://user:pass@localhost/synapse"
+  backend: postgres
+  postgres_url_secret: "postgresql://user:password@localhost/synapse"
 
 http:
   enabled: true
-  port: 80
+  address: "0.0.0.0:80"
 
 https:
   enabled: true
-  port: 443
+  address: "0.0.0.0:443"
   domains:
     - synapse.cmn.dev
   self_signed_validity_days: 365
   acme:
-    enabled: true
-    email: admin@cmn.dev
+    contact: admin@cmn.dev
+    mode: production
     renewal_before_days: 30
 
 cache:
@@ -74,6 +77,16 @@ cargo run
 # Obtains TLS certificate via Let's Encrypt
 # Starts HTTP (80) and HTTPS (443)
 ```
+
+`synapse --help` returns a strict `cli-help-v2` AFDATA event. Use
+`synapse --docs` for the complete generated CLI reference. Structural CLI
+errors use stderr and exit 2; service/domain failures use a strict JSON error
+event on stderr and exit 1.
+
+HTTP JSON responses are strict AFDATA protocol-v1 result/error envelopes.
+Service and access logs use the configured `log_format` (`json`, `yaml`, or
+`plain`) and redact `_secret`, `_url`, legacy embedding `url`, and legacy Nostr
+`relays` values before serialization.
 
 ## API Overview
 
@@ -235,7 +248,8 @@ Build with `--features ruvector`.
 | `nostr` | `nostr-sdk` | Yes |
 | `ruvector` | `ruvector-core` | No |
 
-Default features: `postgres`, `redb`, `nostr`. Use `--no-default-features --features <feature,...>` to compile only what you need. Search is opt-in via `--features ruvector`.
+Default features: `postgres`, `redb`, `nostr`, and `ruvector`. Use
+`--no-default-features --features <feature,...>` to compile only what you need.
 
 ## Development
 
@@ -263,5 +277,6 @@ RUST_LOG=debug cargo run
 
 | Document | Description |
 |----------|-------------|
+| [CLI Reference](docs/cli.md) | Generated closed-world CLI shapes and output contracts |
 | [Deployment Guide](docs/synapse-deployment.md) | Self-host a Synapse instance — configuration, services, operations |
 | [Storage Internals](docs/synapse-storage.md) | Database schema, indexing, and storage backends |

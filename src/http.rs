@@ -62,7 +62,7 @@ pub async fn run_server(
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = TcpListener::bind(addr).await?;
-    info!(addr = %addr, "HTTP server listening (h2c enabled)");
+    info!(listen_addr = %addr, "HTTP server listening (h2c enabled)");
 
     loop {
         tokio::select! {

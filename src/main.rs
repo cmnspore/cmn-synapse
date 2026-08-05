@@ -1,3 +1,4 @@
+mod cli;
 mod cmn_cache;
 mod config;
 mod crawler;
@@ -14,8 +15,8 @@ mod search;
 mod storage;
 mod time;
 
-use clap::{CommandFactory, Parser};
 use std::net::SocketAddr;
+use std::process::ExitCode;
 use std::sync::Arc;
 #[cfg(feature = "postgres")]
 use storage::PostgresStorage;
@@ -27,130 +28,67 @@ use tracing_subscriber::EnvFilter;
 
 use handlers::AppState;
 
-#[derive(Parser, Debug)]
-#[command(
-    name = "synapse",
-    version,
-    about = "Synapse - CMN Federated Indexer",
-    disable_help_subcommand = true
-)]
-struct Args {
-    /// Configuration file path
-    #[arg(long, default_value = "config.yml")]
-    config: String,
-
-    /// Rebuild the search vector index from storage, then exit.
-    /// Requires the ruvector feature and a running embedding server (Ollama).
-    /// Stop the running synapse process before using this flag.
-    #[arg(long)]
-    rebuild_search: bool,
-
-    /// Redirect stdout to this file
-    #[arg(long, value_name = "PATH")]
-    stdout_file: Option<std::path::PathBuf>,
-
-    /// Redirect stderr to this file
-    #[arg(long, value_name = "PATH")]
-    stderr_file: Option<std::path::PathBuf>,
+struct ServiceError {
+    code: &'static str,
+    message: &'static str,
+    hint: &'static str,
 }
 
-fn emit_cli_event(event: agent_first_data::Event) {
-    let stdout = std::io::stdout();
-    let mut emitter =
-        agent_first_data::CliEmitter::new(stdout.lock(), agent_first_data::OutputFormat::Json);
-    let _ = emitter.emit(event);
-}
-
-fn emit_cli_value(value: serde_json::Value) {
-    let stdout = std::io::stdout();
-    let mut emitter =
-        agent_first_data::CliEmitter::new(stdout.lock(), agent_first_data::OutputFormat::Json);
-    let _ = emitter.emit_validated_value(value);
-}
-
-fn write_stdout(text: &str) {
-    let mut stdout = std::io::stdout().lock();
-    let _ = std::io::Write::write_all(&mut stdout, text.as_bytes());
+impl ServiceError {
+    const fn new(code: &'static str, message: &'static str, hint: &'static str) -> ServiceError {
+        ServiceError {
+            code,
+            message,
+            hint,
+        }
+    }
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let raw: Vec<String> = std::env::args().collect();
-    let _stream_redirect =
-        match agent_first_data::stream_redirect::install_from_raw_args(raw.clone()) {
-            Ok(installed) => installed,
-            Err(err) => {
-                emit_cli_event(agent_first_data::build_cli_error(&err.to_string(), None));
-                std::process::exit(2);
-            }
-        };
-
-    let build = match env!("GIT_SHA") {
-        "unknown" => None,
-        sha => Some(sha),
-    };
-    match agent_first_data::cli_handle_version_or_continue(
-        &raw,
-        &Args::command(),
-        "synapse",
-        Some(env!("DISPLAY_NAME")),
-        env!("CARGO_PKG_VERSION"),
-        build,
-    ) {
-        Ok(Some(version)) => {
-            write_stdout(&version);
-            return Ok(());
-        }
-        Ok(None) => {}
-        Err(err) => {
-            emit_cli_event(err);
-            std::process::exit(2);
-        }
+async fn main() -> ExitCode {
+    let (args, _stream_redirect) = cli::resolve_or_exit();
+    match run(args).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => cli::emit_domain_error(error.code, error.message, error.hint),
     }
+}
 
-    match agent_first_data::cli_handle_help_or_continue(
-        &raw,
-        &Args::command(),
-        &agent_first_data::HelpConfig::human_cli_default(),
-    ) {
-        Ok(Some(help)) => {
-            write_stdout(&help);
-            return Ok(());
-        }
-        Ok(None) => {}
-        Err(err) => {
-            emit_cli_value(err);
-            std::process::exit(2);
-        }
-    }
-
-    let args = Args::try_parse().unwrap_or_else(|e| {
-        if matches!(
-            e.kind(),
-            clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
-        ) {
-            write_stdout(&e.to_string());
-            std::process::exit(0);
-        }
-        emit_cli_event(agent_first_data::build_cli_error(
-            &e.to_string(),
-            Some("run synapse --help and retry with a valid configuration path"),
-        ));
-        std::process::exit(2);
-    });
-    let _ = (&args.stdout_file, &args.stderr_file);
-
+async fn run(args: cli::Args) -> Result<(), ServiceError> {
     // Install ring as the default crypto provider for rustls.
     if rustls::crypto::ring::default_provider()
         .install_default()
         .is_err()
     {
-        return Err("Failed to install ring crypto provider".into());
+        return Err(ServiceError::new(
+            "crypto_provider_init_failed",
+            "Failed to initialize the TLS cryptography provider",
+            "restart the process; if it repeats, check for a conflicting rustls provider",
+        ));
     }
 
     // Load config
-    let cfg = Arc::new(config::AppConfig::load(Some(&args.config))?);
-    let http_client = substrate::client::http_client(30)?;
+    let loaded_config = config::AppConfig::load(Some(&args.config)).map_err(|_| {
+        ServiceError::new(
+            "config_load_failed",
+            "Failed to read, parse, or validate the Synapse configuration",
+            "inspect the configured file with afdata, correct it, and retry",
+        )
+    })?;
+    let raw_config = serde_json::to_value(&loaded_config).map_err(|_| {
+        ServiceError::new(
+            "config_serialize_failed",
+            "Failed to prepare the validated configuration for structured logging",
+            "check the configuration value types and retry",
+        )
+    })?;
+    let cfg = Arc::new(loaded_config);
+    let http_client = substrate::client::http_client(30).map_err(|_| {
+        ServiceError::new(
+            "http_client_init_failed",
+            "Failed to initialize the outbound HTTP client",
+            "check the process TLS configuration and available system resources",
+        )
+    })?;
 
     let cmn_cache = Arc::new(cmn_cache::CmnCache::new(
         cfg.cache.cmn_ttl_s,
@@ -176,48 +114,86 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     agent_first_data::afdata_tracing::try_init(
         filter,
         log_format,
-        agent_first_data::Redactor::new(),
-    )?;
+        // Third-party error displays may embed request URLs, response snippets,
+        // or connection strings. Treat only tracing's legacy scalar `error`
+        // field as sensitive; protocol error objects use a separate emitter.
+        agent_first_data::Redactor::new().secret_names(["error"]),
+    )
+    .map_err(|_| {
+        ServiceError::new(
+            "logging_init_failed",
+            "Failed to initialize structured service logging",
+            "ensure no other global tracing subscriber is installed, then restart",
+        )
+    })?;
 
     // Startup config as nested JSON — bypasses tracing (which can't nest).
-    {
-        let raw_yaml = std::fs::read_to_string(&args.config)?;
-        let raw_config: serde_json::Value = serde_yaml::from_str(&raw_yaml)?;
-        log_startup_config(raw_config, &args.config, &cfg.log_format);
-    }
+    log_startup_config(raw_config, &args.config, &cfg.log_format);
 
     // Initialize storage based on config
     let storage = match cfg.storage.backend.as_str() {
         #[cfg(feature = "postgres")]
         "postgres" => {
-            let url = cfg
-                .storage
-                .postgres_url_secret
-                .as_ref()
-                .ok_or("postgres_url_secret required")?;
+            let url = cfg.storage.postgres_url_secret.as_ref().ok_or_else(|| {
+                ServiceError::new(
+                    "storage_config_invalid",
+                    "PostgreSQL storage requires postgres_url_secret",
+                    "set storage.postgres_url_secret in the configuration and retry",
+                )
+            })?;
             info!("Connecting to PostgreSQL...");
-            let pg = PostgresStorage::new(url).await?;
+            let pg = PostgresStorage::new(url).await.map_err(|_| {
+                ServiceError::new(
+                    "storage_init_failed",
+                    "Failed to initialize PostgreSQL storage",
+                    "verify database availability and credentials, then retry",
+                )
+            })?;
             info!("PostgreSQL connected");
             StorageBackend::Postgres(pg)
         }
         #[cfg(not(feature = "postgres"))]
         "postgres" => {
-            return Err("PostgreSQL support not compiled. Enable the 'postgres' feature.".into());
+            return Err(ServiceError::new(
+                "storage_backend_unavailable",
+                "PostgreSQL support is not compiled into this binary",
+                "install a build with the postgres feature or select another storage backend",
+            ));
         }
         #[cfg(feature = "redb")]
         "redb" => {
-            let path = cfg.storage.redb_path.as_ref().ok_or("redb_path required")?;
+            let path = cfg.storage.redb_path.as_ref().ok_or_else(|| {
+                ServiceError::new(
+                    "storage_config_invalid",
+                    "Redb storage requires redb_path",
+                    "set storage.redb_path in the configuration and retry",
+                )
+            })?;
             info!(path = %path, "Opening redb database...");
-            let db = RedbStorage::open(path)?;
+            let db = RedbStorage::open(path).map_err(|_| {
+                ServiceError::new(
+                    "storage_init_failed",
+                    "Failed to initialize redb storage",
+                    "verify the database path, permissions, and file integrity, then retry",
+                )
+            })?;
             info!("Redb opened");
             StorageBackend::Redb(db)
         }
         #[cfg(not(feature = "redb"))]
         "redb" => {
-            return Err("Redb support not compiled. Enable the 'redb' feature.".into());
+            return Err(ServiceError::new(
+                "storage_backend_unavailable",
+                "Redb support is not compiled into this binary",
+                "install a build with the redb feature or select another storage backend",
+            ));
         }
-        other => {
-            return Err(format!("Unknown storage backend: {}", other).into());
+        _ => {
+            return Err(ServiceError::new(
+                "storage_backend_invalid",
+                "The configured storage backend is not supported",
+                "set storage.backend to postgres or redb and retry",
+            ));
         }
     };
 
@@ -300,8 +276,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         rebuild_graph(&bg_storage, &bg_graph).await;
                         match bg_graph.stats() {
                             Ok(stats) => info!(
-                                nodes = stats.total_nodes,
-                                edges = stats.total_edges,
+                                node_count = stats.total_nodes,
+                                edge_count = stats.total_edges,
                                 "Graph rebuild complete"
                             ),
                             Err(e) => warn!(error = %e, "Failed to read graph stats after rebuild"),
@@ -327,15 +303,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
             None => {
-                error!("--rebuild-search requires search to be enabled in config");
-                return Err("Search not enabled".into());
+                return Err(ServiceError::new(
+                    "search_not_enabled",
+                    "Search rebuild requires search to be enabled",
+                    "enable search in the configuration or omit --rebuild-search",
+                ));
             }
         }
     }
     #[cfg(not(feature = "ruvector"))]
     if args.rebuild_search {
-        error!("--rebuild-search requires the ruvector feature");
-        return Err("ruvector feature not enabled".into());
+        return Err(ServiceError::new(
+            "search_backend_unavailable",
+            "Search rebuild is not compiled into this binary",
+            "install a build with the ruvector feature or omit --rebuild-search",
+        ));
     }
 
     let crawler = crawler::Crawler::new(
@@ -381,8 +363,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let https_enabled = cfg.https.as_ref().is_some_and(|h| h.enabled);
 
     if !http_enabled && !https_enabled {
-        error!("No servers enabled. Enable http or https in config.");
-        return Err("No servers enabled".into());
+        return Err(ServiceError::new(
+            "server_config_invalid",
+            "No HTTP or HTTPS server is enabled",
+            "enable at least one server in the configuration and retry",
+        ));
     }
 
     info!(
@@ -402,7 +387,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // HTTP server
     if let Some(ref http_cfg) = cfg.http {
         if http_cfg.enabled {
-            let http_addr: SocketAddr = http_cfg.address.parse()?;
+            let http_addr: SocketAddr = http_cfg.address.parse().map_err(|_| {
+                ServiceError::new(
+                    "http_address_invalid",
+                    "The configured HTTP listen address is invalid",
+                    "set http.address to a valid socket address and retry",
+                )
+            })?;
             let http_shutdown_rx = shutdown_tx.subscribe();
 
             if https_enabled {
@@ -424,7 +415,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // HTTPS server
     if let Some(ref https_cfg) = cfg.https {
         if https_cfg.enabled {
-            let https_addr: SocketAddr = https_cfg.address.parse()?;
+            let https_addr: SocketAddr = https_cfg.address.parse().map_err(|_| {
+                ServiceError::new(
+                    "https_address_invalid",
+                    "The configured HTTPS listen address is invalid",
+                    "set https.address to a valid socket address and retry",
+                )
+            })?;
             let domains = https_cfg.domains.clone();
             let https_app = app.clone();
             let https_storage = state.storage.clone();
@@ -577,9 +574,9 @@ async fn rebuild_graph(storage: &StorageBackend, graph: &search::SporeGraph) {
     }
 
     info!(
-        spores = total_spores,
-        relationships = total_refs,
-        domains = myceliums.len(),
+        spore_count = total_spores,
+        relationship_count = total_refs,
+        domain_count = myceliums.len(),
         "Graph rebuild indexed"
     );
 }
@@ -627,9 +624,9 @@ async fn rebuild_search(storage: &StorageBackend, search: &search::SearchBackend
     }
 
     info!(
-        indexed = indexed,
-        failed = failed,
-        domains = myceliums.len(),
+        indexed_count = indexed,
+        failed_count = failed,
+        domain_count = myceliums.len(),
         "Search rebuild complete"
     );
 }
@@ -672,7 +669,7 @@ async fn mycelium_retry_loop(
                 match state.storage.get_domains_for_retry(i32::MAX).await {
                     Ok(domains) => {
                         if !domains.is_empty() {
-                            info!("Found {} domains to retry", domains.len());
+                            info!(domain_count = domains.len(), "Found domains to retry");
                         }
 
                         for domain in domains {
@@ -740,7 +737,7 @@ async fn mycelium_retry_loop(
                         }
                     }
                     Err(e) => {
-                        error!("Failed to get domains for retry: {}", e);
+                        error!(error = %e, "Failed to get domains for retry");
                     }
                 }
             }
@@ -755,22 +752,103 @@ async fn mycelium_retry_loop(
     Ok(())
 }
 
-/// Emit startup config as a single nested-JSON line to stdout.
-/// Bypasses tracing because tracing flattens all fields (no nested objects/arrays).
-fn log_startup_config(raw_config: serde_json::Value, config_path: &str, log_format: &str) {
-    let event = agent_first_data::json_log(serde_json::json!({
+/// Scrub protocol-defined legacy URL fields without changing their public names.
+fn redact_legacy_config_urls(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(fields) => {
+            for (name, field) in fields {
+                if name == "url" {
+                    if let serde_json::Value::String(raw_url) = field {
+                        *raw_url = agent_first_data::redact_url_secrets(raw_url);
+                    }
+                } else if name == "relays" {
+                    if let serde_json::Value::Array(relays) = field {
+                        for relay in relays {
+                            if let serde_json::Value::String(relay_url) = relay {
+                                *relay_url = agent_first_data::redact_url_secrets(relay_url);
+                            }
+                        }
+                    }
+                }
+                redact_legacy_config_urls(field);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                redact_legacy_config_urls(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn startup_config_event(
+    mut raw_config: serde_json::Value,
+    config_path: &str,
+) -> agent_first_data::Event {
+    redact_legacy_config_urls(&mut raw_config);
+    let mut payload = serde_json::json!({
         "event": "startup",
         "config": raw_config,
         "args": {"config_path": config_path},
         "env": {"RUST_LOG": std::env::var("RUST_LOG").ok()}
-    }))
-    .build();
+    });
+    agent_first_data::Redactor::new().redact_in_place(&mut payload);
+    agent_first_data::json_log(payload).build()
+}
+
+/// Emit startup config as one nested event. Tracing cannot retain nested values.
+fn log_startup_config(raw_config: serde_json::Value, config_path: &str, log_format: &str) {
+    let event = startup_config_event(raw_config, config_path);
     let format = match log_format {
         "plain" => agent_first_data::OutputFormat::Plain,
         "yaml" => agent_first_data::OutputFormat::Yaml,
         _ => agent_first_data::OutputFormat::Json,
     };
     let stdout = std::io::stdout();
-    let mut emitter = agent_first_data::CliEmitter::new(stdout.lock(), format);
+    let mut emitter =
+        agent_first_data::CliEmitter::new(stdout.lock(), format).with_strict_protocol();
     let _ = emitter.emit(event);
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::startup_config_event;
+
+    #[test]
+    fn startup_config_redacts_canonical_and_legacy_secret_boundaries() {
+        let event = startup_config_event(
+            serde_json::json!({
+                "storage": {
+                    "postgres_url_secret": "postgres://user:db-password@example.com/synapse"
+                },
+                "search": {
+                    "embedding": {
+                        "url": "https://user:embedding-password@example.com/api?token_secret=query-canary",
+                        "api_key_secret": "api-key-canary"
+                    }
+                },
+                "nostr": {
+                    "relays": [
+                        "wss://user:relay-password@example.com?token_secret=relay-canary"
+                    ]
+                }
+            }),
+            "config.yml",
+        );
+        let rendered = serde_json::to_string(event.as_value()).unwrap();
+
+        for canary in [
+            "db-password",
+            "embedding-password",
+            "query-canary",
+            "api-key-canary",
+            "relay-password",
+            "relay-canary",
+        ] {
+            assert!(!rendered.contains(canary), "leaked {canary}: {rendered}");
+        }
+        assert!(agent_first_data::validate_protocol_event(event.as_value(), true).is_ok());
+    }
 }

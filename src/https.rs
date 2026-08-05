@@ -35,7 +35,7 @@ pub async fn load_or_create_cert<S: Storage>(
         if !cert.needs_renewal(0) {
             info!(
                 domains = %domains.join(","),
-                expires_at = %cert.expires_at,
+                expires_at_rfc3339 = %cert.expires_at.to_rfc3339(),
                 self_signed = cert.self_signed,
                 "Using existing certificate from storage"
             );
@@ -59,7 +59,7 @@ pub async fn load_or_create_cert<S: Storage>(
 
         info!(
             domains = %domains.join(","),
-            expires_at = %expires_at,
+            expires_at_rfc3339 = %expires_at.to_rfc3339(),
             "Generated and saved self-signed certificate"
         );
 
@@ -129,7 +129,7 @@ pub async fn run_server_self_signed(
     shutdown_rx: tokio::sync::broadcast::Receiver<()>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = TcpListener::bind(addr).await?;
-    info!(addr = %addr, domains = %domains.join(","), "HTTPS server (self-signed)");
+    info!(listen_addr = %addr, domains = %domains.join(","), "HTTPS server (self-signed)");
 
     let acceptor = create_tls_acceptor(storage, domains, true, self_signed_validity_days).await?;
     run_with_acceptor(listener, acceptor, app, shutdown_rx).await
@@ -147,14 +147,14 @@ pub async fn run_server_acme(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = TcpListener::bind(addr).await?;
     let is_staging = acme_cfg.is_staging();
-    info!(addr = %addr, domains = %domains.join(","), staging = is_staging, "HTTPS server (Let's Encrypt)");
+    info!(listen_addr = %addr, domains = %domains.join(","), staging = is_staging, "HTTPS server (Let's Encrypt)");
 
     // Check if we have a valid certificate in storage
     if let Some(cert) = storage.get_cert(domains).await? {
         if !cert.needs_renewal(renewal_days) {
             info!(
                 domains = %domains.join(","),
-                expires_at = %cert.expires_at,
+                expires_at_rfc3339 = %cert.expires_at.to_rfc3339(),
                 "Using existing Let's Encrypt certificate from storage"
             );
 
@@ -244,7 +244,7 @@ async fn run_acme_with_storage(
     });
 
     let addr = listener.local_addr()?;
-    info!(addr = %addr, "ACME HTTPS server listening");
+    info!(listen_addr = %addr, "ACME HTTPS server listening");
 
     let server = axum_server::from_tcp(listener.into_std()?)?
         .acceptor(acceptor)
@@ -286,7 +286,7 @@ async fn sync_cert_to_storage(
                                                 domains, &cert_pem, &key_pem, expires_at, false,
                                             )
                                             .await?;
-                                        info!(domains = %domains.join(","), expires_at = %expires_at,
+                                        info!(domains = %domains.join(","), expires_at_rfc3339 = %expires_at.to_rfc3339(),
                                               "Saved Let's Encrypt certificate to storage");
                                         return Ok(());
                                     }
@@ -378,7 +378,7 @@ async fn certificate_renewal_loop(
                 if cert.needs_renewal(renewal_days) {
                     info!(
                         domains = %domains.join(","),
-                        expires_at = %cert.expires_at,
+                        expires_at_rfc3339 = %cert.expires_at.to_rfc3339(),
                         "Certificate needs renewal"
                     );
                     warn!("Certificate renewal needed. Restart server to renew.");
@@ -404,7 +404,7 @@ pub async fn run_with_acceptor(
     use tower::Service;
 
     let addr = listener.local_addr()?;
-    info!(addr = %addr, "HTTPS server listening");
+    info!(listen_addr = %addr, "HTTPS server listening");
 
     loop {
         tokio::select! {

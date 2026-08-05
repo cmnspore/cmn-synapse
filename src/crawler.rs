@@ -127,8 +127,8 @@ impl Crawler {
                 {
                     info!(
                         domain = %domain,
-                        incoming = incoming_ts,
-                        cached = cached_ts,
+                        incoming_updated_at_epoch_ms = incoming_ts,
+                        cached_updated_at_epoch_ms = cached_ts,
                         "Crawled mycelium not newer than cached, skipping"
                     );
                     return Ok(());
@@ -197,7 +197,7 @@ impl Crawler {
 
         if crawled > 0 {
             info!(
-                count = crawled,
+                crawled_count = crawled,
                 "Indexed missing spores after mycelium pulse"
             );
         }
@@ -227,7 +227,7 @@ impl Crawler {
                 }
                 if removed > 0 {
                     info!(
-                        count = removed,
+                        removed_count = removed,
                         "Removed superseded spores from search index"
                     );
                 }

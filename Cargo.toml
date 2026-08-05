@@ -1,6 +1,6 @@
 [package]
 name = "cmn-synapse"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "The reference CMN indexer — ingests signed manifests, indexes spores and myceliums, serves discovery queries, and syncs across instances via Nostr."
 license = "MIT"
@@ -26,10 +26,10 @@ ruvector = ["dep:ruvector-core"]
 
 [dependencies]
 # shared library
-cmn-substrate = { version = "0.3", features = ["client-safe-dns"] }
+cmn-substrate = { version = "0.4", features = ["client-safe-dns"] }
 
 # Agent-First Data tracing
-agent-first-data = "0.22.0"
+agent-first-data = "0.31.0"
 
 # async runtime
 tokio = { version = "1.53", features = ["full"] }
@@ -62,9 +62,6 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
-# cli
-clap = { version = "4", features = ["derive"] }
-
 # tls
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = "0.26"
@@ -84,13 +81,12 @@ nostr-sdk = { version = "0.44", optional = true }
 ruvector-core = { version = "2.3", default-features = false, features = ["storage"], optional = true }
 
 # encoding
-base64 = "0.22"
+base64 = "0.23"
 
 # utils
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 async-trait = "0.1"
-serde_yaml = "0.9"
 
 [dev-dependencies]
 tempfile = "3.27"
@@ -98,7 +94,7 @@ bs58 = "0.5"
 tokio-tungstenite = "0.30.0"
 urlencoding = "2"
 wiremock = "0.6"
-serial_test = "3"
+serial_test = "4"
 # hex and serde_jcs are already in dependencies but listed here for clarity in tests
 
 [lints.clippy]

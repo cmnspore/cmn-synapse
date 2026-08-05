@@ -29,7 +29,10 @@ pub async fn admin_status(State(state): State<Arc<AppState>>) -> ApiResult {
         }
         Err(e) => {
             warn!(error = %e, "Admin: failed to get myceliums");
-            serde_json::json!({ "error": e.to_string() })
+            serde_json::json!({
+                "available": false,
+                "error_code": "storage_query_failed",
+            })
         }
     };
 

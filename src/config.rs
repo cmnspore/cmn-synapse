@@ -1,12 +1,17 @@
 //! Configuration module for Synapse.
 
-use config::{Config, ConfigError, File};
+use std::path::{Path, PathBuf};
+
+use agent_first_data::document::{DocumentError, DocumentFile};
+use config::ConfigError;
 use serde::{Deserialize, Serialize};
+
+const CONFIG_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct AppConfig {
     pub debug: bool,
-    /// Log output format: "json" (default) or "plain"
+    /// Log output format: "json" (default), "yaml", or "plain"
     #[serde(default = "default_log_format")]
     pub log_format: String,
     /// Service bonds override — when non-empty, replaces embedded spore.core.json bonds on /health
@@ -105,7 +110,8 @@ pub struct NostrConfig {
     /// Enable Nostr integration
     #[serde(default)]
     pub enabled: bool,
-    /// Nostr relay URLs to connect to (e.g., ["wss://relay.damus.io"])
+    /// Legacy public config shape: Nostr relay URLs as a string array.
+    /// Startup output applies the exact `relays` URL adapter before rendering.
     #[serde(default)]
     pub relays: Vec<String>,
     /// Where to persist the Nostr identity key (nsec).
@@ -208,7 +214,8 @@ fn default_index_path() -> String {
 pub struct EmbeddingConfig {
     /// Provider: "ollama" or "openai"
     pub provider: String,
-    /// API base URL
+    /// Legacy public config name for the API base URL.
+    /// Startup output applies the exact `url` adapter before rendering.
     pub url: String,
     /// Model name
     pub model: String,
@@ -324,17 +331,11 @@ fn default_enabled() -> bool {
 
 impl AppConfig {
     pub fn load(config_file: Option<&str>) -> Result<Self, ConfigError> {
-        let config_path = config_file.unwrap_or("config.yml");
-        let config_name = config_path
-            .strip_suffix(".yml")
-            .or_else(|| config_path.strip_suffix(".yaml"))
-            .unwrap_or(config_path);
-
-        let s = Config::builder()
-            .add_source(File::with_name(config_name).required(true))
-            .build()?;
-
-        let mut config: Self = s.try_deserialize()?;
+        let config_path = resolve_config_path(config_file.unwrap_or("config.yml"));
+        let document = DocumentFile::open_capped(&config_path, None, CONFIG_MAX_BYTES)
+            .map_err(|error| document_config_error(&config_path, &error))?;
+        let mut config: Self = agent_first_data::document::from_value(document.value(), "")
+            .map_err(|error| document_config_error(&config_path, &error))?;
         config.retry.backoff_multiplier = config.retry.backoff_multiplier.clamp(1.0, 5.0);
         config.validate()?;
         Ok(config)
@@ -372,11 +373,10 @@ impl AppConfig {
                     "Redb support not compiled. Enable the 'redb' feature.".to_string(),
                 ));
             }
-            other => {
-                return Err(ConfigError::Message(format!(
-                    "Invalid storage backend '{}'. Must be 'postgres' or 'redb'",
-                    other
-                )));
+            _ => {
+                return Err(ConfigError::Message(
+                    "Invalid storage backend; must be 'postgres' or 'redb'".to_string(),
+                ));
             }
         }
 
@@ -403,10 +403,9 @@ impl AppConfig {
             if https.enabled && !self.debug {
                 let mode = &https.acme.mode;
                 if mode != "production" {
-                    return Err(ConfigError::Message(format!(
-                        "ACME mode '{}' is not allowed when debug=false. Use 'production' for real certificates.",
-                        mode
-                    )));
+                    return Err(ConfigError::Message(
+                        "ACME mode must be 'production' when debug=false".to_string(),
+                    ));
                 }
             }
         }
@@ -422,6 +421,29 @@ impl AppConfig {
 
         Ok(())
     }
+}
+
+fn resolve_config_path(config_file: &str) -> PathBuf {
+    let path = PathBuf::from(config_file);
+    if std::fs::symlink_metadata(&path).is_ok() || path.extension().is_some() {
+        return path;
+    }
+    for extension in ["yml", "yaml", "json", "toml"] {
+        let candidate = path.with_extension(extension);
+        if std::fs::symlink_metadata(&candidate).is_ok() {
+            return candidate;
+        }
+    }
+    path
+}
+
+fn document_config_error(path: &Path, error: &DocumentError) -> ConfigError {
+    ConfigError::Message(format!(
+        "{} at {}: {}",
+        error.code(),
+        path.display(),
+        error.redacted_message()
+    ))
 }
 
 #[cfg(test)]
@@ -535,6 +557,32 @@ mod tests {
         let https = config.https.unwrap();
         assert_eq!(https.self_signed_validity_days, 365);
         assert_eq!(https.acme.renewal_before_days, 30);
+    }
+
+    #[test]
+    fn test_app_config_parse_error_does_not_echo_source_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yml");
+        std::fs::write(&path, "storage: [\nsource-secret-canary").unwrap();
+
+        let error = AppConfig::load(path.to_str()).unwrap_err().to_string();
+
+        assert!(error.contains("document_parse_failed"));
+        assert!(!error.contains("source-secret-canary"));
+    }
+
+    #[test]
+    fn test_app_config_refuses_oversized_document_before_parsing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yml");
+        std::fs::write(&path, vec![b'x'; (CONFIG_MAX_BYTES + 1) as usize]).unwrap();
+
+        let error = AppConfig::load(path.to_str()).unwrap_err().to_string();
+
+        // afdata reports an over-cap read under its own code, so a size budget
+        // no longer has to be told apart from "missing" or "unreadable" by
+        // matching on the message text.
+        assert!(error.contains("document_too_large"));
     }
 
     #[test]

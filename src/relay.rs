@@ -136,7 +136,7 @@ pub async fn handle_connection(ws: WebSocket, state: Arc<RelayState>) {
                     None => continue,
                 };
 
-                info!(sub_id = %sub_id, "Relay: REQ received");
+                info!(subscription_id = %sub_id, "Relay: REQ received");
 
                 // Parse filter
                 let filter = parse_filter(&arr[2]);
@@ -163,7 +163,7 @@ pub async fn handle_connection(ws: WebSocket, state: Arc<RelayState>) {
                             serde_json::from_str::<Value>(&event.as_json()).unwrap_or_default()
                         ]);
                         if send_tx.send(msg.to_string()).is_err() {
-                            warn!(sub_id = %sub_id, "Relay: send channel closed while sending stored events");
+                            warn!(subscription_id = %sub_id, "Relay: send channel closed while sending stored events");
                             break;
                         }
                         sent_count += 1;
@@ -173,14 +173,18 @@ pub async fn handle_connection(ws: WebSocket, state: Arc<RelayState>) {
                 // Send EOSE (End of Stored Events)
                 let eose = serde_json::json!(["EOSE", &sub_id]);
                 let _ = send_tx.send(eose.to_string());
-                info!(sub_id = %sub_id, sent = sent_count, "Relay: EOSE sent");
+                info!(
+                    subscription_id = %sub_id,
+                    sent_count,
+                    "Relay: EOSE sent"
+                );
             }
             "CLOSE" => {
                 if arr.len() < 2 {
                     continue;
                 }
                 if let Some(sub_id) = arr[1].as_str() {
-                    info!(sub_id = %sub_id, "Relay: CLOSE received");
+                    info!(subscription_id = %sub_id, "Relay: CLOSE received");
                     subscriptions.write().await.remove(sub_id);
                 }
             }

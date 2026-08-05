@@ -310,8 +310,8 @@ impl NostrBridge {
                 Ok(output) => {
                     info!(
                         event_id = %event.id.to_hex(),
-                        success = output.success.len(),
-                        failed = output.failed.len(),
+                        success_count = output.success.len(),
+                        failed_count = output.failed.len(),
                         "Forwarded pulse to Nostr"
                     );
                 }
@@ -338,7 +338,10 @@ impl NostrBridge {
             return Ok(());
         }
 
-        info!(relay_count = self.relays.len(), relays = %self.relays.join(","), "Starting Nostr subscription listener");
+        info!(
+            relay_count = self.relays.len(),
+            "Starting Nostr subscription listener"
+        );
 
         let client = Client::builder().signer(self.keys.clone()).build();
 
@@ -362,8 +365,8 @@ impl NostrBridge {
             Ok(output) => {
                 info!(
                     subscription_id = %output.val,
-                    success = output.success.len(),
-                    failed = output.failed.len(),
+                    success_count = output.success.len(),
+                    failed_count = output.failed.len(),
                     "Nostr subscription active, listening for CMN events"
                 );
             }
@@ -393,7 +396,10 @@ impl NostrBridge {
                             // Ignore non-event notifications (Message, Shutdown, etc.)
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            warn!(missed = n, "Notification channel lagged, some events may be missed");
+                            warn!(
+                                missed_count = n,
+                                "Notification channel lagged, some events may be missed"
+                            );
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                             warn!("Notification channel closed");

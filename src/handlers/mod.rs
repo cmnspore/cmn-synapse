@@ -173,7 +173,8 @@ async fn access_log(
     };
 
     let stdout = std::io::stdout();
-    let mut emitter = agent_first_data::CliEmitter::new(stdout.lock(), format);
+    let mut emitter =
+        agent_first_data::CliEmitter::new(stdout.lock(), format).with_strict_protocol();
     let _ = emitter.emit(event);
 
     res
