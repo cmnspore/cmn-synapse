@@ -1,17 +1,16 @@
 //! Closed-world command-line registry for the service binary.
 
-use std::io::Write;
-
 use agent_first_data::{
-    build_afdata_cli, cli_error_event, cli_help_event, cli_parse_output, cli_version_event,
-    render_cli_reference, ArgSpec, BoundOutcome, BuiltCliSpec, CliEmitter, CliSpec, CliSpecError,
-    Combination, CommandSpec, OutputFormat, OutputPlan, OutputSpec, OutputTo, ResolvedInvocation,
+    ArgSpec, BuiltCliSpec, CliEmitter, CliSpec, CliSpecError, Combination, CommandSpec,
+    OutputFormat, OutputPlan, OutputSpec, OutputTo, ResolvedInvocation, build_afdata_cli,
+    cli_error_event,
 };
 
 #[derive(Debug)]
 pub struct Args {
     pub config: String,
     pub rebuild_search: bool,
+    pub prune_nostr: bool,
 }
 
 fn service_output() -> OutputSpec {
@@ -47,10 +46,21 @@ fn cli_spec() -> Result<BuiltCliSpec, CliSpecError> {
                     "Rebuild the search vector index from storage, then exit; requires the \
                          ruvector feature and a running embedding server",
                 ))
+                .arg(ArgSpec::flag("--prune-nostr").about(
+                    "Delete stored Nostr events whose exact content is absent from CMN storage, then exit",
+                ))
                 .combination(
                     Combination::new("serve")
                         .action("serve")
                         .about("Run the federated indexer services")
+                        .optional(["config"])
+                        .output(service_output()),
+                )
+                .combination(
+                    Combination::new("prune-nostr")
+                        .action("prune_nostr")
+                        .about("Clean legacy relay history against verified CMN storage")
+                        .required(["prune_nostr"])
                         .optional(["config"])
                         .output(service_output()),
                 )
@@ -80,6 +90,10 @@ fn build_args(invocation: &ResolvedInvocation) -> Args {
             .optional("rebuild_search")
             .and_then(agent_first_data::CliValue::as_bool)
             .unwrap_or(false),
+        prune_nostr: invocation
+            .optional("prune_nostr")
+            .and_then(agent_first_data::CliValue::as_bool)
+            .unwrap_or(false),
     }
 }
 
@@ -93,7 +107,11 @@ pub fn resolve_or_exit() -> (
         Err(error) => emit_startup_error_or_exit("cli_spec_invalid", &error.to_string()),
     };
     let handler = build_args as fn(&ResolvedInvocation) -> Args;
-    let app = match cli.bind_actions([("serve", handler), ("rebuild_search", handler)]) {
+    let app = match cli.bind_actions([
+        ("serve", handler),
+        ("rebuild_search", handler),
+        ("prune_nostr", handler),
+    ]) {
         Ok(app) => app,
         Err(error) => emit_startup_error_or_exit("cli_actions_invalid", &error.to_string()),
     };
@@ -107,38 +125,19 @@ pub fn resolve_or_exit() -> (
         ),
     };
 
-    match outcome {
-        BoundOutcome::Run(invocation) => {
-            let redirect = install_redirect_or_exit(invocation.output_plan());
-            (invocation.run(), redirect)
+    let redirect = install_redirect_or_exit(outcome.output_plan());
+    let invocation = match outcome.into_run() {
+        Ok(invocation) => invocation,
+        Err(code) => {
+            let code_to_i32 = if code == std::process::ExitCode::SUCCESS {
+                0
+            } else {
+                4
+            };
+            std::process::exit(code_to_i32);
         }
-        BoundOutcome::Docs(docs) => {
-            let _redirect = install_redirect_or_exit(docs.output_plan());
-            write_text_or_exit(&render_cli_reference(&cli), OutputTo::Stdout)
-        }
-        BoundOutcome::Help(help) => {
-            let _redirect = install_redirect_or_exit(help.output_plan());
-            let format = format_of(help.output_plan());
-            if format == OutputFormat::Plain {
-                write_text_or_exit(&help.plain(), raw_destination(help.output_plan()));
-            }
-            emit_event_or_exit(
-                cli_help_event(&help),
-                format,
-                destination_of(help.output_plan()),
-                0,
-            )
-        }
-        BoundOutcome::Version(version) => {
-            let _redirect = install_redirect_or_exit(version.output_plan());
-            emit_event_or_exit(
-                cli_version_event(&version),
-                format_of(version.output_plan()),
-                destination_of(version.output_plan()),
-                0,
-            )
-        }
-    }
+    };
+    (invocation.run(), redirect)
 }
 
 fn install_redirect_or_exit(
@@ -158,26 +157,6 @@ fn install_redirect_or_exit(
     {
         Ok(redirect) => redirect,
         Err(error) => emit_startup_error_or_exit("output_setup_failed", &error.to_string()),
-    }
-}
-
-fn format_of(plan: &OutputPlan) -> OutputFormat {
-    plan.format()
-        .and_then(|format| cli_parse_output(format).ok())
-        .unwrap_or(OutputFormat::Json)
-}
-
-fn destination_of(plan: &OutputPlan) -> OutputTo {
-    plan.destination()
-        .and_then(|destination| OutputTo::parse(destination).ok())
-        .unwrap_or(OutputTo::Split)
-}
-
-fn raw_destination(plan: &OutputPlan) -> OutputTo {
-    if plan.destination() == Some("stderr") {
-        OutputTo::Stderr
-    } else {
-        OutputTo::Stdout
     }
 }
 
@@ -217,58 +196,54 @@ pub fn emit_domain_error(code: &str, message: &str, hint: &str) -> std::process:
     std::process::ExitCode::from(emitter.finish(event, 1))
 }
 
-#[allow(clippy::disallowed_methods)]
-fn write_text_or_exit(text: &str, destination: OutputTo) -> ! {
-    let result = match destination {
-        OutputTo::Stderr => std::io::stderr().lock().write_all(text.as_bytes()),
-        OutputTo::Split | OutputTo::Stdout => std::io::stdout().lock().write_all(text.as_bytes()),
-    };
-    std::process::exit(if result.is_ok() { 0 } else { 4 })
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
-    use agent_first_data::CliOutcome;
+    use agent_first_data::{CliOutcome, render_cli_reference};
 
     #[test]
     fn every_registered_shape_resolves_and_dispatches() {
         let cli = cli_spec().unwrap();
         let handler = build_args as fn(&ResolvedInvocation) -> Args;
         let app = cli
-            .bind_actions([("serve", handler), ("rebuild_search", handler)])
+            .bind_actions([
+                ("serve", handler),
+                ("rebuild_search", handler),
+                ("prune_nostr", handler),
+            ])
             .unwrap();
-        // Both shapes dispatch, but only one asks for a rebuild: the registry
-        // has to carry that distinction through to the args, not just resolve.
-        let mut modes: Vec<(String, bool)> = app
+        // Each maintenance shape must carry its action through to the args.
+        let mut modes: Vec<(String, bool, bool)> = app
             .call_every_combination()
             .into_iter()
-            .map(|(combination, args)| (combination, args.rebuild_search))
+            .map(|(combination, args)| (combination, args.rebuild_search, args.prune_nostr))
             .collect();
         modes.sort();
         assert_eq!(
             modes,
             [
-                ("rebuild-search".to_string(), true),
-                ("serve".to_string(), false),
+                ("prune-nostr".to_string(), false, true),
+                ("rebuild-search".to_string(), true, false),
+                ("serve".to_string(), false, false),
             ]
         );
     }
 
     #[test]
-    fn help_exposes_both_legal_shapes_in_one_round_trip() {
+    fn help_exposes_all_legal_shapes_in_one_round_trip() {
         let cli = cli_spec().unwrap();
         let CliOutcome::Help(help) = cli.resolve_from(["synapse", "--help"]).unwrap() else {
             panic!("expected help");
         };
         assert_eq!(help.model().schema, "cli-help-v2");
-        assert_eq!(help.model().shapes.len(), 2);
-        assert!(help
-            .model()
-            .shapes
-            .iter()
-            .any(|shape| shape.usage.contains("--rebuild-search")));
+        assert_eq!(help.model().shapes.len(), 3);
+        assert!(
+            help.model()
+                .shapes
+                .iter()
+                .any(|shape| shape.usage.contains("--rebuild-search"))
+        );
         assert!(render_cli_reference(&cli).contains("rebuild-search"));
     }
 }

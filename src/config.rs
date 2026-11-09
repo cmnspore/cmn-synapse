@@ -342,6 +342,16 @@ impl AppConfig {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        #[cfg(feature = "nostr")]
+        if self
+            .nostr
+            .as_ref()
+            .is_some_and(|nostr| nostr.enabled && nostr.max_events == 0)
+        {
+            return Err(ConfigError::Message(
+                "nostr.max_events must be greater than zero".to_string(),
+            ));
+        }
         // Validate storage config
         match self.storage.backend.as_str() {
             #[cfg(feature = "postgres")]
@@ -381,32 +391,35 @@ impl AppConfig {
         }
 
         // Validate HTTPS config if enabled
-        if let Some(ref https) = self.https {
-            if https.enabled && https.address.is_empty() {
-                return Err(ConfigError::Message(
-                    "https.address is required when https is enabled".to_string(),
-                ));
-            }
+        if let Some(ref https) = self.https
+            && https.enabled
+            && https.address.is_empty()
+        {
+            return Err(ConfigError::Message(
+                "https.address is required when https is enabled".to_string(),
+            ));
         }
 
         // Validate HTTP config if enabled
-        if let Some(ref http) = self.http {
-            if http.enabled && http.address.is_empty() {
-                return Err(ConfigError::Message(
-                    "http.address is required when http is enabled".to_string(),
-                ));
-            }
+        if let Some(ref http) = self.http
+            && http.enabled
+            && http.address.is_empty()
+        {
+            return Err(ConfigError::Message(
+                "http.address is required when http is enabled".to_string(),
+            ));
         }
 
         // Validate ACME mode: production required when debug=false
-        if let Some(ref https) = self.https {
-            if https.enabled && !self.debug {
-                let mode = &https.acme.mode;
-                if mode != "production" {
-                    return Err(ConfigError::Message(
-                        "ACME mode must be 'production' when debug=false".to_string(),
-                    ));
-                }
+        if let Some(ref https) = self.https
+            && https.enabled
+            && !self.debug
+        {
+            let mode = &https.acme.mode;
+            if mode != "production" {
+                return Err(ConfigError::Message(
+                    "ACME mode must be 'production' when debug=false".to_string(),
+                ));
             }
         }
 

@@ -20,27 +20,40 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: macos-latest
+          - os: macos-15
             target: aarch64-apple-darwin
             archive: tar
-          - os: macos-latest
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             archive: tar
-          - os: ubuntu-22.04
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             archive: tar
-          - os: windows-latest
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive: tar
+          - os: windows-2025
             target: x86_64-pc-windows-msvc
             archive: zip
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+          fetch-depth: 0
+          persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify release source
+        shell: bash
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: ./scripts/release-assets.sh "$TAG"
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
           targets: ${{ matrix.target }}
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
           path: |
             ~/.cargo/registry
@@ -53,22 +66,38 @@ jobs:
 
       - name: Package
         shell: bash
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          TARGET: ${{ matrix.target }}
+          ARCHIVE_KIND: ${{ matrix.archive }}
         run: |
-          TAG="${{ github.event.inputs.tag || github.ref_name }}"
-          BIN_DIR="target/${{ matrix.target }}/release"
-          if [ "${{ matrix.archive }}" = "zip" ]; then
-            ARCHIVE="synapse-${TAG}-${{ matrix.target }}.zip"
+          set -euo pipefail
+          BIN_DIR="target/${TARGET}/release"
+          if [ "$ARCHIVE_KIND" = "zip" ]; then
+            ARCHIVE="synapse-${TAG}-${TARGET}.zip"
             cd "$BIN_DIR" && 7z a "../../../$ARCHIVE" synapse.exe && cd -
           else
-            ARCHIVE="synapse-${TAG}-${{ matrix.target }}.tar.gz"
+            ARCHIVE="synapse-${TAG}-${TARGET}.tar.gz"
             tar -czf "$ARCHIVE" -C "$BIN_DIR" synapse
           fi
-          sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256" 2>/dev/null || shasum -a 256 "$ARCHIVE" > "${ARCHIVE}.sha256"
           echo "TAG=$TAG" >> "$GITHUB_ENV"
+          # Take the digest and write the line, rather than letting each
+          # platform's tool spell it. Git Bash's sha256sum treats an archive as
+          # binary and writes `<digest> *<name>`, where GNU coreutils on Linux
+          # and shasum on macOS write `<digest>  <name>`. This file is published
+          # for people and read by the package channels, so one spelling on
+          # every platform is the point — and it is the spelling
+          # release-assets.sh verifies the upload against.
+          if command -v sha256sum >/dev/null 2>&1; then
+            DIGEST="$(sha256sum "$ARCHIVE" | awk '{print $1}')"
+          else
+            DIGEST="$(shasum -a 256 "$ARCHIVE" | awk '{print $1}')"
+          fi
+          printf '%s  %s\n' "$DIGEST" "$ARCHIVE" > "${ARCHIVE}.sha256"
           echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
 
-      - name: Upload to release
+      - name: Upload immutable release assets
         shell: bash
-        run: gh release upload "$TAG" "$ARCHIVE" "${ARCHIVE}.sha256" --clobber
+        run: ./scripts/release-assets.sh "$TAG" "$ARCHIVE" "${ARCHIVE}.sha256"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

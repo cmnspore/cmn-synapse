@@ -9,7 +9,7 @@ use crate::storage::{Storage, StorageBackend};
 use chrono::{Duration, Utc};
 use rcgen::generate_simple_self_signed;
 use rustls::ServerConfig;
-use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -187,8 +187,8 @@ async fn run_acme_with_storage(
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use futures::StreamExt;
-    use tokio_rustls_acme::caches::DirCache;
     use tokio_rustls_acme::AcmeConfig as TokioAcmeConfig;
+    use tokio_rustls_acme::caches::DirCache;
 
     let domains = domains.to_vec();
     let contact = format!("mailto:{}", acme_cfg.contact);
@@ -272,29 +272,23 @@ async fn sync_cert_to_storage(
     for entry in std::fs::read_dir(cache_dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.is_file() {
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.starts_with("cached_cert") {
-                    let data = std::fs::read(&path)?;
-                    if let Ok(content) = String::from_utf8(data) {
-                        if let Some((cert_pem, key_pem)) = extract_cert_and_key(&content) {
-                            if let Ok((certs, _)) = parse_pem(&cert_pem, &key_pem) {
-                                if let Some(cert_der) = certs.first() {
-                                    if let Ok(expires_at) = get_cert_expiry(cert_der) {
-                                        storage
-                                            .save_cert(
-                                                domains, &cert_pem, &key_pem, expires_at, false,
-                                            )
-                                            .await?;
-                                        info!(domains = %domains.join(","), expires_at_rfc3339 = %expires_at.to_rfc3339(),
+        if path.is_file()
+            && let Some(name) = path.file_name().and_then(|n| n.to_str())
+            && name.starts_with("cached_cert")
+        {
+            let data = std::fs::read(&path)?;
+            if let Ok(content) = String::from_utf8(data)
+                && let Some((cert_pem, key_pem)) = extract_cert_and_key(&content)
+                && let Ok((certs, _)) = parse_pem(&cert_pem, &key_pem)
+                && let Some(cert_der) = certs.first()
+                && let Ok(expires_at) = get_cert_expiry(cert_der)
+            {
+                storage
+                    .save_cert(domains, &cert_pem, &key_pem, expires_at, false)
+                    .await?;
+                info!(domains = %domains.join(","), expires_at_rfc3339 = %expires_at.to_rfc3339(),
                                               "Saved Let's Encrypt certificate to storage");
-                                        return Ok(());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                return Ok(());
             }
         }
     }
@@ -366,7 +360,7 @@ async fn certificate_renewal_loop(
     domains: Vec<String>,
     renewal_days: i64,
 ) {
-    use tokio::time::{interval, Duration};
+    use tokio::time::{Duration, interval};
 
     let mut interval = interval(Duration::from_secs(12 * 60 * 60));
 

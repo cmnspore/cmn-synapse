@@ -14,7 +14,7 @@ use crate::handlers::AppState;
 use crate::storage::{SporeBond, Storage, StorageBackend};
 use anyhow::Result;
 use serde_json::Value;
-use tracing::{info, info_span, warn, Instrument};
+use tracing::{Instrument, info, info_span, warn};
 
 /// The result of a successful validation + verification pass.
 #[allow(dead_code)]
@@ -316,18 +316,47 @@ pub async fn validate_and_verify(
         substrate::SchemaType::Cmn | substrate::SchemaType::SporeCore => {
             return Err(IngestError::SchemaUnknown(
                 "Unsupported content type".into(),
-            ))
+            ));
         }
     };
     let content_type = parsed_payload.content_type();
     let parsed_uri = substrate::parse_uri(parsed_payload.uri())
         .map_err(|e| IngestError::UriInvalid(e.to_string()))?;
+
+    let expected_kind = match schema_type {
+        substrate::SchemaType::Spore => substrate::CmnUriKind::Spore,
+        substrate::SchemaType::Mycelium => substrate::CmnUriKind::Mycelium,
+        substrate::SchemaType::Taste => substrate::CmnUriKind::Taste,
+        _ => {
+            return Err(IngestError::SchemaUnknown(
+                "Unsupported content type".into(),
+            ));
+        }
+    };
+    if parsed_uri.kind != expected_kind {
+        return Err(IngestError::UriInvalid(format!(
+            "URI kind {:?} does not match schema type {:?}",
+            parsed_uri.kind, schema_type
+        )));
+    }
+
     let uri = parsed_payload.uri().to_string();
-    let domain = parsed_uri.domain;
+    let domain = parsed_uri.domain.clone();
     let hash = parsed_payload
         .verified_uri_hash(parsed_uri.hash.as_deref())
         .map_err(|e| IngestError::HashInvalid(e.to_string()))?;
     let author_domain = parsed_payload.author_domain().to_string();
+
+    if matches!(
+        schema_type,
+        substrate::SchemaType::Mycelium | substrate::SchemaType::Taste
+    ) && parsed_uri.domain != author_domain
+    {
+        return Err(IngestError::UriInvalid(format!(
+            "Capsule URI domain '{}' does not match author domain '{}'",
+            parsed_uri.domain, author_domain
+        )));
+    }
     let timestamp = parsed_payload.timestamp_ms();
     let embedded_core_key = parsed_payload.embedded_core_key().map(str::to_string);
     let spore_bonds = parsed_payload.spore_bonds();
@@ -422,6 +451,23 @@ pub async fn validate_and_verify(
 }
 
 /// Resolve a domain key, respecting CMN_PUBLIC_KEY_OVERRIDE in debug mode.
+fn key_resolution_error(domain: &str, error: anyhow::Error) -> IngestError {
+    if error
+        .downcast_ref::<crate::cmn_cache::DomainVerificationFailure>()
+        .is_some()
+    {
+        IngestError::SignatureInvalid {
+            error: "Domain identity verification failed".to_string(),
+            fallback_hint: None,
+        }
+    } else {
+        IngestError::KeyFetchFailed {
+            domain: domain.to_string(),
+            error: error.to_string(),
+        }
+    }
+}
+
 async fn resolve_key_with_override(
     domain: &str,
     cmn_cache: &CmnCache,
@@ -437,14 +483,10 @@ async fn resolve_key_with_override(
         warn!("CMN_PUBLIC_KEY_OVERRIDE is set but ignored (debug=false)");
     }
 
-    let ResolvedKey { key, source, hint } =
-        cmn_cache
-            .resolve_key(domain, storage)
-            .await
-            .map_err(|e| IngestError::KeyFetchFailed {
-                domain: domain.to_string(),
-                error: e.to_string(),
-            })?;
+    let ResolvedKey { key, source, hint } = cmn_cache
+        .resolve_key(domain, storage)
+        .await
+        .map_err(|error| key_resolution_error(domain, error))?;
 
     Ok((key, source, hint))
 }
@@ -476,10 +518,7 @@ async fn resolve_confirmed_key_with_override(
     let ResolvedKey { key, source, hint } = cmn_cache
         .resolve_confirmed_key(domain, key, signed_at_epoch_ms, storage)
         .await
-        .map_err(|e| IngestError::KeyFetchFailed {
-            domain: domain.to_string(),
-            error: e.to_string(),
-        })?;
+        .map_err(|error| key_resolution_error(domain, error))?;
 
     Ok((key, source, hint))
 }
@@ -537,12 +576,11 @@ async fn store_spore(
 
     // Side effects (only for new content)
     #[cfg(feature = "nostr")]
-    if opts.forward_nostr {
-        if let Some(ref relay_state) = state.nostr_relay {
-            if let Err(e) = relay_state.bridge.forward_pulse(&pulse.payload).await {
-                warn!(error = %e, "Failed to forward spore pulse to Nostr");
-            }
-        }
+    if opts.forward_nostr
+        && let Some(ref relay_state) = state.nostr_relay
+        && let Err(e) = relay_state.bridge.forward_pulse(&pulse.payload).await
+    {
+        warn!(error = %e, "Failed to forward spore pulse to Nostr");
     }
 
     #[cfg(feature = "ruvector")]
@@ -594,21 +632,20 @@ async fn store_mycelium(
 
     // Version check: only accept strictly newer timestamps.
     // Same semantics as crawler::crawl_domain_inner, but returns 409 instead of silent skip.
-    let is_update = if let Ok(Some(cached_data)) = state.storage.get_mycelium(&pulse.domain).await {
-        if let Ok(cached) = serde_json::from_slice::<substrate::Mycelium>(&cached_data) {
-            let cached_ts = cached.capsule.core.updated_at_epoch_ms;
-            if substrate::compare_version_timestamps(pulse.timestamp, cached_ts)
-                != substrate::VersionOrder::Newer
-            {
-                return Err(StoreError::VersionNotNewer {
-                    incoming_timestamp_epoch_ms: pulse.timestamp,
-                    cached_timestamp_epoch_ms: cached_ts,
-                });
-            }
-            true
-        } else {
-            false
+    let is_update = if let Some(cached_data) = state.storage.get_mycelium(&pulse.domain).await? {
+        let cached: substrate::Mycelium =
+            serde_json::from_slice(&cached_data).map_err(anyhow::Error::from)?;
+        let cached_ts = cached.capsule.core.updated_at_epoch_ms;
+        if substrate::compare_version_timestamps(pulse.timestamp, cached_ts)
+            != substrate::VersionOrder::Newer
+        {
+            spawn_missing_spore_crawl(state, &pulse.domain);
+            return Err(StoreError::VersionNotNewer {
+                incoming_timestamp_epoch_ms: pulse.timestamp,
+                cached_timestamp_epoch_ms: cached_ts,
+            });
         }
+        true
     } else {
         false
     };
@@ -619,37 +656,36 @@ async fn store_mycelium(
         .await?;
 
     #[cfg(feature = "nostr")]
-    if opts.forward_nostr {
-        if let Some(ref relay_state) = state.nostr_relay {
-            if let Err(e) = relay_state.bridge.forward_pulse(&pulse.payload).await {
-                warn!(error = %e, "Failed to forward mycelium pulse to Nostr");
-            }
-        }
+    if opts.forward_nostr
+        && let Some(ref relay_state) = state.nostr_relay
+        && let Err(e) = relay_state.bridge.forward_pulse(&pulse.payload).await
+    {
+        warn!(error = %e, "Failed to forward mycelium pulse to Nostr");
     }
 
     // Suppress unused variable warnings when features are disabled
     let _ = opts;
 
-    // Crawl missing spores in background
-    let crawl_state_crawler = state.crawler.clone();
-    let crawl_domain = pulse.domain.clone();
+    spawn_missing_spore_crawl(state, &pulse.domain);
+
+    let action = if is_update { "updated" } else { "indexed" };
+    info!(uri = %pulse.uri, action = %action, "Ingested mycelium");
+    Ok(action)
+}
+
+fn spawn_missing_spore_crawl(state: &AppState, domain: &str) {
+    let crawler = state.crawler.clone();
+    let domain = domain.to_string();
     tokio::spawn(async move {
-        let span = info_span!("post_pulse_crawl", domain = %crawl_domain);
+        let span = info_span!("post_pulse_crawl", domain = %domain);
         async {
-            if let Err(e) = crawl_state_crawler
-                .crawl_missing_spores(&crawl_domain)
-                .await
-            {
-                warn!(error = %e, "Post-pulse spore crawl failed");
+            if let Err(error) = crawler.crawl_missing_spores(&domain).await {
+                warn!(error = %error, "Post-pulse spore crawl failed");
             }
         }
         .instrument(span)
         .await;
     });
-
-    let action = if is_update { "updated" } else { "indexed" };
-    info!(uri = %pulse.uri, action = %action, "Ingested mycelium");
-    Ok(action)
 }
 
 async fn store_taste(
@@ -667,14 +703,13 @@ async fn store_taste(
         .await?;
 
     // Index taste by its own content hash for GET /synapse/taste/:hash lookups
-    if let Some(ref taste_hash) = pulse.hash {
-        if let Err(e) = state
+    if let Some(ref taste_hash) = pulse.hash
+        && let Err(e) = state
             .storage
             .save_taste_index(taste_hash, &pulse.data)
             .await
-        {
-            warn!(error = %e, "Failed to index taste by hash");
-        }
+    {
+        warn!(error = %e, "Failed to index taste by hash");
     }
 
     info!(uri = %pulse.uri, target_uri = %target_uri, "Ingested taste");

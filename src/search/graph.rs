@@ -2,9 +2,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::RwLock;
 
 use anyhow::Result;
+use ruvector_core::DistanceMetric;
 use ruvector_core::advanced::hypergraph::TemporalGranularity;
 use ruvector_core::advanced::{Hyperedge, HypergraphIndex, TemporalHyperedge};
-use ruvector_core::DistanceMetric;
 use serde::Serialize;
 
 use super::EmbedClient;
@@ -236,12 +236,11 @@ impl SporeGraph {
 
 /// Extract hash from a CMN URI: "cmn://domain/hash" → "hash"
 fn parse_hash_from_uri(uri: &str) -> String {
-    if let Ok(parsed) = substrate::parse_uri(uri) {
-        if parsed.kind == substrate::CmnUriKind::Spore {
-            if let Some(hash) = parsed.hash {
-                return hash;
-            }
-        }
+    if let Ok(parsed) = substrate::parse_uri(uri)
+        && parsed.kind == substrate::CmnUriKind::Spore
+        && let Some(hash) = parsed.hash
+    {
+        return hash;
     }
     uri.to_string()
 }

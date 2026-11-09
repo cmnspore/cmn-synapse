@@ -2,7 +2,7 @@
   "$schema": "https://cmn.dev/schemas/v1/spore-core.json",
   "id": "cmn-synapse",
   "name": "CMN Synapse",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "domain": "cmn.dev",
   "key": "ed25519.7BmCWmBb2YeUWR7pmHvwAvi9wRm96VpZsJvZFSTfc2Uu",
   "synopsis": "The reference CMN indexer — ingests signed manifests, indexes spores and myceliums, serves discovery queries, and syncs across instances via Nostr.",
@@ -12,12 +12,8 @@
   ],
   "license": "MIT",
   "mutations": [
-    "Replace clap with an agent-first-data closed-world CLI registry — `synapse --help` returns a strict cli-help-v2 event, `--docs` renders the CLI reference published as docs/cli.md, and argv resolves before any configuration, secret, or network I/O; structural CLI errors exit 2 while service startup failures exit 1 as strict protocol-v1 error events carrying a stable code, message, and hint",
-    "Load configuration through afdata's DocumentFile with a size cap and extension probing, so a malformed or oversized config reports a coded document error (document_parse_failed / document_too_large) instead of echoing file content, and validation failures stop quoting the offending value back",
-    "Redact secrets everywhere a URL can reach an event — HTTP response bodies, diagnostic prose, and the startup config dump all scrub credentials and secret query parameters from CMN's protocol-defined bare `url` fields, legacy embedding `url`, and legacy Nostr `relays` entries, without renaming the fields the spec defines",
-    "Rename service tracing fields to Agent-First Data suffix conventions (expires_at → expires_at_rfc3339, addr → listen_addr, bare counts → *_count) and convert the remaining interpolated log messages into structured fields",
-    "Support yaml alongside json and plain as the service log format, emitting the nested startup config event through a strict-protocol emitter",
-    "Upgrade the stack — agent-first-data 0.31, cmn-substrate 0.4 (nutrient extra-field preservation), base64 0.23, serial_test 4 — and drop the clap and serde_yaml dependencies"
+    "Depend on cmn-substrate 0.5 and agent-first-slug 0.9.1",
+    "Upgrade dependencies to agent-first-data 0.37.0"
   ],
   "bonds": [
     {
@@ -46,13 +42,13 @@
     },
     {
       "relation": "depends_on",
-      "uri": "cmn://agentfirstkit.com/b3.7Kf6i6HNpFxooXKQTCzfugkqq89rPCuM1mekg8hsKAQC",
+      "uri": "cmn://agentfirstkit.com/b3.2SPPFLXoA85arfaYNgoYcE4Uergq6P5yWDKtEczwptC6",
       "id": "agent-first-data",
       "reason": "All API response fields and log events use Agent-First Data suffix conventions"
     },
     {
       "relation": "depends_on",
-      "uri": "cmn://cmn.dev/b3.AfcKgjH6e2nDWfoFPhSxEeEqhA9K8RY2jQN9SoE7PCN5",
+      "uri": "cmn://cmn.dev/b3.9UPrph5wpcXTHjuT4nzMUPdBsfe1sG1F9Co8wLhnky4M",
       "id": "cmn-spec",
       "reason": "Implements the CMN protocol specification — reference Synapse indexer"
     }

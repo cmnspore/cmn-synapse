@@ -161,6 +161,11 @@ Restart synapse. To rebuild the search index from existing data:
 synapse --rebuild-search
 ```
 
+The command logs `indexed_count` and `failed_count`. Any storage enumeration,
+read, JSON, or embedding failure produces exit 1 with `search_rebuild_failed`;
+successfully indexed items remain available. Fix the reported service or data
+failure and rerun. Only a complete rebuild exits 0.
+
 ## 6. Enable Nostr (Optional)
 
 Nostr relay enables cross-instance synchronization:
@@ -177,6 +182,33 @@ nostr:
 ```
 
 This activates the `/nostr` WebSocket endpoint and connects to external relays. A secp256k1 identity key is auto-generated on first run.
+
+Incoming events are verified before relay history is updated. A valid duplicate
+or older mycelium receives `OK=true`; a temporarily unavailable domain receives
+`OK=false` with a retry reason and is not cached. Publishers must retry it.
+
+`nostr.max_events` (default 10,000) must be positive and bounds the database as
+well as memory. Startup trims older oversized history, and runtime evictions
+delete database rows. A storage initialization/read failure prevents startup.
+PostgreSQL retains its newest insertions, with event IDs breaking ties; redb
+trims by event ID order. Each backend is deterministic independently.
+
+Connections allow 32 subscriptions, a 64-message send queue, and 256 historical
+events when REQ omits a limit (maximum 1,024). A slow sender or lost broadcast
+closes the connection; clients must reconnect and resubscribe with an appropriate
+bounded query.
+
+For legacy history, stop the service, back up the database, then run this
+explicit one-time operation before restarting:
+
+```bash
+synapse --prune-nostr --config config.yml
+```
+
+It retains only events whose exact content exists in the current CMN tables,
+including the matching host capsule for spores. It removes unverified history
+and legitimate relay-only events that are no longer represented there. No
+network verification or automatic cleanup runs on subsequent startups.
 
 ## 7. Data Sources & Bootstrapping
 
@@ -224,7 +256,7 @@ Domains become known to your instance through:
 
 1. **Pulse** — A domain sends `hypha mycelium pulse --synapse https://your-instance/` after releasing
 2. **Nostr** — Events from subscribed relays contain domain information, which is verified and indexed
-3. **Crawler retry** — Once a domain is known but its crawl failed, the background loop retries every 60 seconds with permanent retry (no max retry limit)
+3. **Crawler retry** — Network errors, timeouts, and 5xx responses enter persisted retry state. The background loop checks every 60 seconds with backoff; 404, invalid signatures, and mismatched content hashes are logged and skipped. Unchanged or older remote manifests still complete missing spores in the last verified local inventory.
 
 There is no seed list or manual domain configuration — all domains are discovered dynamically through pulses and Nostr events.
 

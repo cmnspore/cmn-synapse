@@ -1,5 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+mod support;
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::Value;
@@ -826,9 +828,10 @@ mod pulse_tests {
         let (signing_key, public_key_b58) = generate_test_keypair();
         let domain = "test-pulse.local";
 
-        // Set CMN_PUBLIC_KEY_OVERRIDE to bypass cmn.json fetch
         let public_key = format!("ed25519.{}", public_key_b58);
-        std::env::set_var("CMN_PUBLIC_KEY_OVERRIDE", &public_key);
+        if support::run_with_key_override(&public_key) {
+            return;
+        }
 
         let app = create_test_app().await;
 
@@ -845,9 +848,6 @@ mod pulse_tests {
             )
             .await
             .unwrap();
-
-        // Clean up env var
-        std::env::remove_var("CMN_PUBLIC_KEY_OVERRIDE");
 
         let status = response.status();
         let body = axum::body::to_bytes(response.into_body(), 10000)
@@ -866,9 +866,10 @@ mod pulse_tests {
         let domain = "test-spore-pulse.local";
         let hash = "b3.abc123def456";
 
-        // Set CMN_PUBLIC_KEY_OVERRIDE to bypass cmn.json fetch
         let public_key = format!("ed25519.{}", public_key_b58);
-        std::env::set_var("CMN_PUBLIC_KEY_OVERRIDE", &public_key);
+        if support::run_with_key_override(&public_key) {
+            return;
+        }
 
         let app = create_test_app().await;
 
@@ -886,9 +887,6 @@ mod pulse_tests {
             .await
             .unwrap();
 
-        // Clean up env var
-        std::env::remove_var("CMN_PUBLIC_KEY_OVERRIDE");
-
         let status = response.status();
         let body = axum::body::to_bytes(response.into_body(), 10000)
             .await
@@ -905,9 +903,10 @@ mod pulse_tests {
         let (_signing_key, public_key_b58) = generate_test_keypair();
         let domain = "test-invalid-sig.local";
 
-        // Set CMN_PUBLIC_KEY_OVERRIDE to bypass cmn.json fetch
         let public_key = format!("ed25519.{}", public_key_b58);
-        std::env::set_var("CMN_PUBLIC_KEY_OVERRIDE", &public_key);
+        if support::run_with_key_override(&public_key) {
+            return;
+        }
 
         let app = create_test_app().await;
 
@@ -926,9 +925,6 @@ mod pulse_tests {
             )
             .await
             .unwrap();
-
-        // Clean up env var
-        std::env::remove_var("CMN_PUBLIC_KEY_OVERRIDE");
 
         let status = response.status();
         let body = axum::body::to_bytes(response.into_body(), 10000)
@@ -1090,7 +1086,9 @@ mod pulse_tests {
         let domain = "test-clock-skew-reject.local";
 
         let public_key = format!("ed25519.{}", public_key_b58);
-        std::env::set_var("CMN_PUBLIC_KEY_OVERRIDE", &public_key);
+        if support::run_with_key_override(&public_key) {
+            return;
+        }
 
         let app = create_test_app().await;
 
@@ -1110,8 +1108,6 @@ mod pulse_tests {
             )
             .await
             .unwrap();
-
-        std::env::remove_var("CMN_PUBLIC_KEY_OVERRIDE");
 
         let status = response.status();
         let body = axum::body::to_bytes(response.into_body(), 10000)
@@ -1139,7 +1135,9 @@ mod pulse_tests {
         let domain = "test-clock-skew-accept.local";
 
         let public_key = format!("ed25519.{}", public_key_b58);
-        std::env::set_var("CMN_PUBLIC_KEY_OVERRIDE", &public_key);
+        if support::run_with_key_override(&public_key) {
+            return;
+        }
 
         let app = create_test_app().await;
 
@@ -1159,8 +1157,6 @@ mod pulse_tests {
             .await
             .unwrap();
 
-        std::env::remove_var("CMN_PUBLIC_KEY_OVERRIDE");
-
         let status = response.status();
         let body = axum::body::to_bytes(response.into_body(), 10000)
             .await
@@ -1179,7 +1175,9 @@ mod pulse_tests {
         let domain = "test-mycelium-dup.local";
 
         let public_key = format!("ed25519.{}", public_key_b58);
-        std::env::set_var("CMN_PUBLIC_KEY_OVERRIDE", &public_key);
+        if support::run_with_key_override(&public_key) {
+            return;
+        }
 
         let app = create_test_app().await;
         let ts = now_epoch_ms();
@@ -1221,8 +1219,6 @@ mod pulse_tests {
             .await
             .unwrap();
 
-        std::env::remove_var("CMN_PUBLIC_KEY_OVERRIDE");
-
         let status2 = response2.status();
         let body2 = axum::body::to_bytes(response2.into_body(), 10000)
             .await
@@ -1243,7 +1239,9 @@ mod pulse_tests {
         let domain = "test-mycelium-conflict.local";
 
         let public_key = format!("ed25519.{}", public_key_b58);
-        std::env::set_var("CMN_PUBLIC_KEY_OVERRIDE", &public_key);
+        if support::run_with_key_override(&public_key) {
+            return;
+        }
 
         let app = create_test_app().await;
         let ts = now_epoch_ms();
@@ -1285,8 +1283,6 @@ mod pulse_tests {
             )
             .await
             .unwrap();
-
-        std::env::remove_var("CMN_PUBLIC_KEY_OVERRIDE");
 
         let status2 = response2.status();
         let body2 = axum::body::to_bytes(response2.into_body(), 10000)

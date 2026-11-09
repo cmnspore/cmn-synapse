@@ -1,6 +1,6 @@
+use super::AppState;
 use super::common::mirror_replicates;
 use super::response::{self, ApiResult};
-use super::AppState;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use std::sync::Arc;

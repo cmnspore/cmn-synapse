@@ -32,7 +32,7 @@ fn help_is_strict_help_v2_on_stdout() {
     assert_eq!(event["result"]["help"]["schema"], "cli-help-v2");
     assert_eq!(
         event["result"]["help"]["shapes"].as_array().unwrap().len(),
-        2
+        3
     );
 }
 
@@ -99,4 +99,64 @@ fn lifecycle_output_can_be_redirected_to_a_file() {
     let event = parse_event(&bytes);
     assert!(agent_first_data::validate_protocol_event(&event, true).is_ok());
     assert_eq!(event["result"]["help"]["schema"], "cli-help-v2");
+}
+
+#[cfg(all(feature = "redb", feature = "nostr"))]
+#[tokio::test]
+async fn explicit_history_cleanup_cli_persists_through_restart() {
+    use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, Tag};
+    use synapse::storage::Storage;
+
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("data.redb");
+    let storage = synapse::storage::RedbStorage::open(&database).unwrap();
+    let payload = serde_json::json!({"capsule":{"uri":"cmn://cleanup.test/b3.data"}});
+    storage
+        .save_spore(
+            "b3.data",
+            "cleanup.test",
+            &serde_json::to_vec(&payload).unwrap(),
+            &[],
+        )
+        .await
+        .unwrap();
+    let event = EventBuilder::new(Kind::Custom(30078), payload.to_string())
+        .tag(Tag::hashtag("cmn-spore"))
+        .finalize(&Keys::generate())
+        .unwrap();
+    storage
+        .save_nostr_event(&event.id.to_hex(), event.as_json().as_bytes())
+        .await
+        .unwrap();
+    storage
+        .save_nostr_event("legacy-malformed", b"{}")
+        .await
+        .unwrap();
+    drop(storage);
+    let config = serde_json::json!({"debug":false,"storage":{"backend":"redb","redb_path":database},"http":{"enabled":true,"address":"127.0.0.1:0"}});
+    let config_path = directory.path().join("config.json");
+    std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_synapse"))
+        .arg("--prune-nostr")
+        .arg("--config")
+        .arg(&config_path)
+        .output()
+        .await
+        .unwrap();
+    assert!(output.status.success());
+    let storage = synapse::storage::StorageBackend::Redb(
+        synapse::storage::RedbStorage::open(&database).unwrap(),
+    );
+    assert_eq!(storage.get_nostr_events().await.unwrap().len(), 1);
+    let config: synapse::config::NostrConfig = serde_json::from_value(
+        serde_json::json!({"enabled":true,"key_store":"storage","max_events":10}),
+    )
+    .unwrap();
+    let restarted = synapse::nostr::NostrBridge::from_config(&config, &storage, 1_048_576)
+        .await
+        .unwrap();
+    assert_eq!(
+        restarted.events().read().await.front().unwrap().id,
+        event.id
+    );
 }

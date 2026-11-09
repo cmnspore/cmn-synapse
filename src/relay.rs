@@ -15,11 +15,8 @@ use nostr_sdk::prelude::*;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc, RwLock};
-use tracing::{info, warn};
-
-/// CMN event kind for filtering
-const CMN_EVENT_KIND: u16 = 30078;
+use tokio::sync::{RwLock, broadcast, mpsc};
+use tracing::warn;
 
 /// Relay state shared across WebSocket connections.
 pub struct RelayState {
@@ -43,221 +40,261 @@ struct CmnFilter {
     multi_letter_tags: HashMap<String, Vec<String>>,
 }
 
-/// Handle a single WebSocket connection as a NIP-01 relay.
-pub async fn handle_connection(ws: WebSocket, state: Arc<RelayState>) {
-    info!("Relay: new WebSocket connection");
-    let (mut ws_tx, mut ws_rx) = ws.split();
+/// Bound each connection independently; history sends wait only after releasing storage locks.
+pub const DEFAULT_HISTORY_LIMIT: usize = 256;
+pub const MAX_HISTORY_LIMIT: usize = 1024;
+pub const MAX_SUBSCRIPTIONS: usize = 32;
+const SEND_QUEUE_CAPACITY: usize = 64;
+const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
-    // mpsc channel so both the main loop and the broadcast forwarder
-    // can send messages to the client through a single writer task.
-    let (send_tx, mut send_rx) = mpsc::unbounded_channel::<String>();
+async fn send_message(sender: &mpsc::Sender<String>, message: Value) -> bool {
+    matches!(
+        tokio::time::timeout(SEND_TIMEOUT, sender.send(message.to_string())).await,
+        Ok(Ok(()))
+    )
+}
 
-    // Writer task: drains the mpsc channel into the WebSocket sink.
-    let writer_handle = tokio::spawn(async move {
-        while let Some(text) = send_rx.recv().await {
-            if ws_tx.send(Message::Text(text.into())).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    // Per-connection subscriptions: subscription_id -> CmnFilter
-    let subscriptions: Arc<RwLock<HashMap<String, CmnFilter>>> =
-        Arc::new(RwLock::new(HashMap::new()));
-
-    // Subscribe to broadcast channel for new events
-    let mut event_rx = state.event_tx.subscribe();
-
-    // Spawn task to forward broadcast events to matching subscriptions
-    let subs_clone = subscriptions.clone();
-    let send_tx_broadcast = send_tx.clone();
-    let forward_handle = tokio::spawn(async move {
-        while let Ok(event) = event_rx.recv().await {
-            let subs = subs_clone.read().await;
-            for (sub_id, filter) in subs.iter() {
-                if event_matches_filter(&event, filter) {
-                    let msg = serde_json::json!([
-                        "EVENT",
-                        sub_id,
-                        serde_json::from_str::<Value>(&event.as_json()).unwrap_or_default()
-                    ]);
-                    if send_tx_broadcast.send(msg.to_string()).is_err() {
+async fn forward_events(
+    mut events: broadcast::Receiver<Event>,
+    subscriptions: Arc<RwLock<HashMap<String, CmnFilter>>>,
+    sender: mpsc::Sender<String>,
+    stop: tokio::sync::watch::Sender<bool>,
+) {
+    loop {
+        match events.recv().await {
+            Ok(event) => {
+                let matching: Vec<String> = {
+                    let subscriptions = subscriptions.read().await;
+                    subscriptions
+                        .iter()
+                        .filter(|(_, filter)| event_matches_filter(&event, filter))
+                        .map(|(id, _)| id.clone())
+                        .collect()
+                };
+                for id in matching {
+                    if sender
+                        .try_send(serde_json::json!(["EVENT", id, &event]).to_string())
+                        .is_err()
+                    {
+                        let _ = stop.send(true);
                         return;
                     }
                 }
             }
+            Err(broadcast::error::RecvError::Lagged(missed_count)) => {
+                warn!(
+                    missed_count,
+                    "Closing lagged relay connection; client must resubscribe"
+                );
+                let _ = stop.send(true);
+                return;
+            }
+            Err(broadcast::error::RecvError::Closed) => {
+                let _ = stop.send(true);
+                return;
+            }
+        }
+    }
+}
+
+/// Handle a single WebSocket connection as a NIP-01 relay.
+pub async fn handle_connection(ws: WebSocket, state: Arc<RelayState>) {
+    let (mut ws_tx, mut ws_rx) = ws.split();
+    let (send_tx, mut send_rx) = mpsc::channel::<String>(SEND_QUEUE_CAPACITY);
+    let (stop_tx, mut writer_stop) = tokio::sync::watch::channel(false);
+    let mut connection_stop = stop_tx.subscribe();
+    let writer_signal = stop_tx.clone();
+    let mut writer_handle = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = writer_stop.changed() => {
+                    let close = axum::extract::ws::CloseFrame { code: 1013, reason: "relay stream interrupted; resubscribe".into() };
+                    let _ = tokio::time::timeout(SEND_TIMEOUT, ws_tx.send(Message::Close(Some(close)))).await;
+                    break;
+                }
+                message = send_rx.recv() => {
+                    let Some(text) = message else { break; };
+                    if !matches!(tokio::time::timeout(SEND_TIMEOUT, ws_tx.send(Message::Text(text.into()))).await, Ok(Ok(()))) {
+                        let _ = writer_signal.send(true);
+                        break;
+                    }
+                }
+            }
         }
     });
-
-    // Process incoming messages
-    while let Some(Ok(msg)) = ws_rx.next().await {
-        let text = match msg {
-            Message::Text(t) => t.to_string(),
-            Message::Close(_) => {
-                info!("Relay: client sent Close");
-                break;
-            }
+    let subscriptions: Arc<RwLock<HashMap<String, CmnFilter>>> =
+        Arc::new(RwLock::new(HashMap::new()));
+    let forward_handle = tokio::spawn(forward_events(
+        state.event_tx.subscribe(),
+        subscriptions.clone(),
+        send_tx.clone(),
+        stop_tx.clone(),
+    ));
+    loop {
+        let message = tokio::select! {
+            _ = connection_stop.changed() => break,
+            message = ws_rx.next() => message,
+        };
+        let Some(Ok(message)) = message else {
+            break;
+        };
+        let text = match message {
+            Message::Text(text) => text,
+            Message::Close(_) => break,
             _ => continue,
         };
-
         let parsed: Value = match serde_json::from_str(&text) {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(error = %e, "Relay: invalid JSON from client");
-                let notice = serde_json::json!(["NOTICE", "Invalid JSON"]);
-                let _ = send_tx.send(notice.to_string());
+            Ok(value) => value,
+            Err(_) => {
+                if !send_message(&send_tx, serde_json::json!(["NOTICE", "Invalid JSON"])).await {
+                    break;
+                }
                 continue;
             }
         };
-
-        let arr = match parsed.as_array() {
-            Some(a) if !a.is_empty() => a,
-            _ => continue,
+        let Some(array) = parsed.as_array() else {
+            continue;
         };
-
-        let msg_type = match arr[0].as_str() {
-            Some(t) => t,
-            None => continue,
-        };
-
-        match msg_type {
-            "EVENT" => {
-                if arr.len() < 2 {
-                    continue;
+        match array.first().and_then(Value::as_str) {
+            Some("EVENT") if array.len() >= 2 => {
+                let acknowledgement = handle_event(&array[1], &state).await;
+                if !send_message(&send_tx, acknowledgement).await {
+                    break;
                 }
-                handle_event(&arr[1], &state).await;
             }
-            "REQ" => {
-                if arr.len() < 3 {
+            Some("REQ") if array.len() >= 3 => {
+                let Some(id) = array[1].as_str() else {
                     continue;
-                }
-                let sub_id = match arr[1].as_str() {
-                    Some(s) => s.to_string(),
-                    None => continue,
                 };
-
-                info!(subscription_id = %sub_id, "Relay: REQ received");
-
-                // Parse filter
-                let filter = parse_filter(&arr[2]);
-
-                // Register subscription FIRST so broadcast events are also matched
-                subscriptions
-                    .write()
+                if id.len() > 128 {
+                    if !send_message(
+                        &send_tx,
+                        serde_json::json!(["CLOSED", id, "invalid: subscription id too long"]),
+                    )
                     .await
-                    .insert(sub_id.clone(), filter.clone());
-
-                // Send stored matching events directly to this client
-                let events_lock = state.bridge.events();
-                let events = events_lock.read().await;
-                let mut sent_count = 0usize;
-                let send_limit = filter.inner.limit.unwrap_or(usize::MAX);
-                for event in events.iter() {
-                    if sent_count >= send_limit {
+                    {
                         break;
                     }
-                    if event_matches_filter(event, &filter) {
-                        let msg = serde_json::json!([
-                            "EVENT",
-                            &sub_id,
-                            serde_json::from_str::<Value>(&event.as_json()).unwrap_or_default()
-                        ]);
-                        if send_tx.send(msg.to_string()).is_err() {
-                            warn!(subscription_id = %sub_id, "Relay: send channel closed while sending stored events");
-                            break;
-                        }
-                        sent_count += 1;
-                    }
-                }
-
-                // Send EOSE (End of Stored Events)
-                let eose = serde_json::json!(["EOSE", &sub_id]);
-                let _ = send_tx.send(eose.to_string());
-                info!(
-                    subscription_id = %sub_id,
-                    sent_count,
-                    "Relay: EOSE sent"
-                );
-            }
-            "CLOSE" => {
-                if arr.len() < 2 {
                     continue;
                 }
-                if let Some(sub_id) = arr[1].as_str() {
-                    info!(subscription_id = %sub_id, "Relay: CLOSE received");
-                    subscriptions.write().await.remove(sub_id);
+                let filter = parse_filter(&array[2]);
+                let accepted = {
+                    let mut subscriptions = subscriptions.write().await;
+                    if subscriptions.contains_key(id) || subscriptions.len() < MAX_SUBSCRIPTIONS {
+                        subscriptions.insert(id.to_string(), filter.clone());
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if !accepted {
+                    if !send_message(
+                        &send_tx,
+                        serde_json::json!(["CLOSED", id, "restricted: too many subscriptions"]),
+                    )
+                    .await
+                    {
+                        break;
+                    }
+                    continue;
+                }
+                let events_lock = state.bridge.events();
+                let history: Vec<Event> = {
+                    let events = events_lock.read().await;
+                    events
+                        .iter()
+                        .filter(|event| event_matches_filter(event, &filter))
+                        .take(
+                            filter
+                                .inner
+                                .limit
+                                .unwrap_or(DEFAULT_HISTORY_LIMIT)
+                                .min(MAX_HISTORY_LIMIT),
+                        )
+                        .cloned()
+                        .collect()
+                };
+                let mut sent = true;
+                for event in history {
+                    if !send_message(&send_tx, serde_json::json!(["EVENT", id, event])).await {
+                        sent = false;
+                        break;
+                    }
+                }
+                if !sent || !send_message(&send_tx, serde_json::json!(["EOSE", id])).await {
+                    break;
+                }
+            }
+            Some("CLOSE") if array.len() >= 2 => {
+                if let Some(id) = array[1].as_str() {
+                    subscriptions.write().await.remove(id);
                 }
             }
             _ => {}
         }
     }
-
+    let _ = stop_tx.send(true);
     forward_handle.abort();
-    writer_handle.abort();
+    if tokio::time::timeout(SEND_TIMEOUT, &mut writer_handle)
+        .await
+        .is_err()
+    {
+        writer_handle.abort();
+    }
 }
 
-/// Handle an incoming EVENT message.
-async fn handle_event(event_json: &Value, state: &RelayState) {
-    // Parse the event
-    let event_str = event_json.to_string();
-    let event = match Event::from_json(&event_str) {
-        Ok(e) => e,
-        Err(e) => {
-            warn!(error = %e, "Invalid Nostr event");
-            return;
-        }
+/// Return a NIP-01 acknowledgement for every event, without exposing verifier error text.
+async fn handle_event(event_json: &Value, state: &RelayState) -> Value {
+    let id = event_json.get("id").and_then(Value::as_str).unwrap_or("");
+    let acknowledgement = |accepted, reason| serde_json::json!(["OK", id, accepted, reason]);
+    let event = match Event::from_json(event_json.to_string()) {
+        Ok(event) => event,
+        Err(_) => return acknowledgement(false, "invalid: malformed Nostr event"),
     };
-
-    // Validate: must be kind 30078
-    if event.kind != Kind::Custom(CMN_EVENT_KIND) {
-        warn!(kind = ?event.kind, "Rejected non-CMN event");
-        return;
+    let Some(app_state) = state.app_state.get() else {
+        return acknowledgement(false, "error: CMN verifier unavailable; retry later");
+    };
+    if let Err(error) = crate::nostr::process_cmn_event_from_relay(
+        &event,
+        app_state,
+        state.max_body_bytes,
+        app_state.config.pulse.max_clock_skew_s * 1000,
+        app_state.config.pulse.max_taste_clock_skew_s * 1000,
+    )
+    .await
+    {
+        warn!(error = %error, "Rejected relay event before caching");
+        let reason = if error
+            .downcast_ref::<crate::ingest::IngestError>()
+            .is_some_and(|error| {
+                matches!(
+                    error,
+                    crate::ingest::IngestError::KeyFetchFailed { .. }
+                        | crate::ingest::IngestError::SignatureInvalid {
+                            fallback_hint: Some(_),
+                            ..
+                        }
+                )
+            }) {
+            "error: domain verification unavailable; retry later"
+        } else if error.downcast_ref::<crate::ingest::StoreError>().is_some() {
+            "error: CMN storage unavailable; retry later"
+        } else {
+            "invalid: CMN verification failed"
+        };
+        return acknowledgement(false, reason);
     }
-
-    // Validate: must have a CMN content tag
-    let has_cmn_tag = event.tags.iter().any(|tag| {
-        let tag_vec: Vec<String> = tag.clone().to_vec();
-        tag_vec.len() >= 2
-            && tag_vec[0] == "t"
-            && (tag_vec[1] == "cmn-spore"
-                || tag_vec[1] == "cmn-mycelium"
-                || tag_vec[1] == "cmn-taste")
-    });
-
-    if !has_cmn_tag {
-        warn!("Rejected event without CMN tag");
-        return;
-    }
-
-    // Verify event signature
-    if event.verify().is_err() {
-        warn!("Rejected event with invalid signature");
-        return;
-    }
-
-    // Store using shared bridge method (dedup + cap + persist)
-    state.bridge.store_event(&event).await;
-    info!(event_id = %event.id.to_hex(), "Stored CMN event via relay");
-
-    // Process CMN content (unified ingest pipeline)
-    if let Some(app_state) = state.app_state.get() {
-        if let Err(e) = crate::nostr::process_cmn_event_from_relay(
-            &event,
-            app_state,
-            state.max_body_bytes,
-            app_state.config.pulse.max_clock_skew_s * 1000,
-            app_state.config.pulse.max_taste_clock_skew_s * 1000,
-        )
-        .await
-        {
-            warn!(error = %e, "Failed to process CMN event content");
+    match state.bridge.store_event(&event).await {
+        Ok(true) => {
+            let _ = state.event_tx.send(event);
+            acknowledgement(true, "")
         }
-    } else {
-        warn!("AppState not yet initialized, skipping CMN event processing");
+        Ok(false) => acknowledgement(true, "duplicate: already stored"),
+        Err(error) => {
+            warn!(error = %error, "Failed to persist verified relay event");
+            acknowledgement(false, "error: relay storage unavailable; retry later")
+        }
     }
-
-    // Broadcast to subscribers
-    let _ = state.event_tx.send(event);
 }
 
 /// Parse a NIP-01 filter from JSON.
@@ -295,10 +332,10 @@ fn parse_filter(filter_json: &Value) -> CmnFilter {
 
                 // Single-character tags go into nostr-sdk Filter (NIP-01 standard)
                 if tag_name.len() == 1 {
-                    if let Some(ch) = tag_name.chars().next() {
-                        if let Ok(slt) = SingleLetterTag::from_char(ch) {
-                            filter = filter.custom_tags(slt, str_values);
-                        }
+                    if let Some(ch) = tag_name.chars().next()
+                        && let Ok(slt) = SingleLetterTag::from_char(ch)
+                    {
+                        filter = filter.custom_tags(slt, str_values);
                     }
                 } else {
                     // Multi-letter tags (domain, uri, hash) — CMN extension
@@ -330,22 +367,22 @@ fn parse_filter(filter_json: &Value) -> CmnFilter {
 /// Check if an event matches a CmnFilter.
 fn event_matches_filter(event: &Event, filter: &CmnFilter) -> bool {
     // Kind check
-    if let Some(kinds) = &filter.inner.kinds {
-        if !kinds.contains(&event.kind) {
-            return false;
-        }
+    if let Some(kinds) = &filter.inner.kinds
+        && !kinds.contains(&event.kind)
+    {
+        return false;
     }
 
     // Timestamp checks (NIP-01: since/until)
-    if let Some(since) = filter.inner.since {
-        if event.created_at < since {
-            return false;
-        }
+    if let Some(since) = filter.inner.since
+        && event.created_at < since
+    {
+        return false;
     }
-    if let Some(until) = filter.inner.until {
-        if event.created_at > until {
-            return false;
-        }
+    if let Some(until) = filter.inner.until
+        && event.created_at > until
+    {
+        return false;
     }
 
     // Single-letter tag check (NIP-01 standard: #t, #d, #e, #p, etc.)
@@ -372,4 +409,67 @@ fn event_matches_filter(event: &Event, filter: &CmnFilter) -> bool {
     }
 
     true
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod queue_tests {
+    use super::*;
+
+    fn event(sequence: usize) -> Event {
+        EventBuilder::new(Kind::Custom(30078), sequence.to_string())
+            .finalize(&Keys::generate())
+            .unwrap()
+    }
+
+    fn subscriptions() -> Arc<RwLock<HashMap<String, CmnFilter>>> {
+        Arc::new(RwLock::new(HashMap::from([(
+            "live".into(),
+            parse_filter(&serde_json::json!({})),
+        )])))
+    }
+
+    #[tokio::test]
+    async fn lagged_stream_signals_connection_close() {
+        let subscriptions = subscriptions();
+        let guard = subscriptions.write().await;
+        let (events, receiver) = broadcast::channel(2);
+        let (sender, _outgoing) = mpsc::channel(64);
+        let (stop, mut signal) = tokio::sync::watch::channel(false);
+        let forward = tokio::spawn(forward_events(
+            receiver,
+            subscriptions.clone(),
+            sender,
+            stop,
+        ));
+        events.send(event(0)).unwrap();
+        tokio::task::yield_now().await;
+        for sequence in 1..8 {
+            events.send(event(sequence)).unwrap();
+        }
+        drop(guard);
+        tokio::time::timeout(std::time::Duration::from_secs(1), signal.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(*signal.borrow());
+        forward.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn full_client_queue_signals_close_without_waiting_for_reader() {
+        let (events, receiver) = broadcast::channel(16);
+        let (sender, _outgoing) = mpsc::channel(1);
+        let (stop, mut signal) = tokio::sync::watch::channel(false);
+        let forward = tokio::spawn(forward_events(receiver, subscriptions(), sender, stop));
+        events.send(event(0)).unwrap();
+        tokio::task::yield_now().await;
+        events.send(event(1)).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), signal.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(*signal.borrow());
+        forward.await.unwrap();
+    }
 }

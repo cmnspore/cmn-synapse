@@ -70,6 +70,13 @@ pub struct SearchQuery {
     pub offset: usize,
 }
 
+impl SearchQuery {
+    /// Number of candidates needed for this page and its pagination probe.
+    pub fn checked_fetch_count(&self) -> Option<usize> {
+        self.offset.checked_add(self.limit)?.checked_add(1)
+    }
+}
+
 /// Trait for search engine implementations.
 #[async_trait]
 pub trait Search: Send + Sync {
@@ -123,6 +130,57 @@ impl Search for SearchBackend {
 pub struct EmbedClient {
     http: reqwest::Client,
     config: EmbeddingConfig,
+}
+
+/// Every attempted storage read, JSON parse and embedding contributes to this result.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct RebuildStatistics {
+    pub indexed_count: usize,
+    pub failed_count: usize,
+}
+
+pub async fn rebuild_search<S: crate::storage::Storage, E: Search>(
+    storage: &S,
+    search: &E,
+) -> RebuildStatistics {
+    let mut statistics = RebuildStatistics::default();
+    let domains = match storage.get_all_myceliums().await {
+        Ok(domains) => domains,
+        Err(error) => {
+            tracing::error!(error = %error, "Failed to enumerate search rebuild domains");
+            statistics.failed_count = 1;
+            return statistics;
+        }
+    };
+    for domain in domains {
+        let hashes = match storage.get_domain_spores(&domain.domain).await {
+            Ok(hashes) => hashes,
+            Err(error) => {
+                tracing::warn!(error = %error, "Failed to enumerate search rebuild spores");
+                statistics.failed_count += 1;
+                continue;
+            }
+        };
+        for hash in hashes {
+            let result = async {
+                let data = storage
+                    .get_spore_on_host(&domain.domain, &hash)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("Spore listed in storage is missing"))?;
+                let value = serde_json::from_slice(&data)?;
+                search.index_spore(&domain.domain, &hash, &value).await
+            }
+            .await;
+            match result {
+                Ok(()) => statistics.indexed_count += 1,
+                Err(error) => {
+                    tracing::warn!(error = %error, hash = %hash, "Search rebuild item failed");
+                    statistics.failed_count += 1;
+                }
+            }
+        }
+    }
+    statistics
 }
 
 impl EmbedClient {
@@ -254,5 +312,32 @@ impl EmbedClient {
 
         results.sort_by_key(|(i, _)| *i);
         Ok(results.into_iter().map(|(_, v)| v).collect())
+    }
+}
+
+#[cfg(test)]
+mod pagination_tests {
+    use super::SearchQuery;
+
+    #[test]
+    fn pagination_probe_rejects_overflow_at_both_additions() {
+        let mut query = SearchQuery {
+            text: "example".into(),
+            domain: None,
+            license: None,
+            strain: None,
+            bonds: vec![],
+            updated_after: None,
+            updated_before: None,
+            limit: 20,
+            offset: 5,
+        };
+        assert_eq!(query.checked_fetch_count(), Some(26));
+        query.offset = usize::MAX - query.limit - 1;
+        assert_eq!(query.checked_fetch_count(), Some(usize::MAX));
+        query.offset += 1;
+        assert_eq!(query.checked_fetch_count(), None);
+        query.offset = usize::MAX;
+        assert_eq!(query.checked_fetch_count(), None);
     }
 }

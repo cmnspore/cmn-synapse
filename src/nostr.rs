@@ -7,7 +7,7 @@
 
 use crate::config::NostrConfig;
 use crate::storage::{Storage, StorageBackend};
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use nostr_sdk::prelude::*;
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
@@ -51,6 +51,10 @@ impl NostrBridge {
         storage: &StorageBackend,
         pulse_max_body_bytes: usize,
     ) -> Result<Self> {
+        anyhow::ensure!(
+            config.max_events > 0,
+            "nostr.max_events must be greater than zero"
+        );
         let keys = if config.key_store == "storage" {
             // Database-backed key storage
             Self::load_or_generate_key_db(storage).await?
@@ -65,7 +69,8 @@ impl NostrBridge {
         };
 
         // Load persisted events from storage
-        let persisted = storage.get_nostr_events().await.unwrap_or_default();
+        storage.trim_nostr_events(config.max_events).await?;
+        let persisted = storage.get_nostr_events().await?;
         let mut events = VecDeque::new();
         let mut event_ids = HashMap::new();
         for event_json in &persisted {
@@ -80,7 +85,9 @@ impl NostrBridge {
 
         // Build long-lived forward client if relays are configured and forwarding is enabled
         let forward_client = if config.forward_pulse && !config.relays.is_empty() {
-            let client = Client::builder().signer(keys.clone()).build();
+            let client = Client::builder()
+                .authenticator(SignerAuthenticator::new(keys.clone()))
+                .build();
             for relay_url in &config.relays {
                 if let Err(e) = client.add_relay(relay_url).await {
                     warn!(relay_url = %relay_url, error = %e, "Failed to add relay");
@@ -218,12 +225,12 @@ impl NostrBridge {
     }
 
     /// Store an event in the in-memory ring buffer and persist to storage.
-    pub(crate) async fn store_event(&self, event: &Event) {
+    pub(crate) async fn store_event(&self, event: &Event) -> Result<bool> {
         // O(1) dedup check via HashMap
         {
             let ids = self.event_ids.read().await;
             if ids.contains_key(&event.id) {
-                return;
+                return Ok(false);
             }
         }
 
@@ -232,9 +239,20 @@ impl NostrBridge {
 
         // Double-check under write lock
         if ids.contains_key(&event.id) {
-            return;
+            return Ok(false);
         }
 
+        let evicted_ids: Vec<String> = events
+            .iter()
+            .take(events.len().saturating_sub(self.max_events - 1))
+            .map(|event| event.id.to_hex())
+            .collect();
+        let id = event.id.to_hex();
+        let json = event.as_json();
+        // Keep dedup and cache unchanged on failure so a publisher can retry.
+        self.storage
+            .mutate_nostr_events(Some((&id, json.as_bytes())), &evicted_ids)
+            .await?;
         while events.len() >= self.max_events {
             if let Some(evicted) = events.pop_front() {
                 ids.remove(&evicted.id);
@@ -242,16 +260,7 @@ impl NostrBridge {
         }
         ids.insert(event.id, ());
         events.push_back(event.clone());
-        drop(ids);
-        drop(events);
-
-        if let Err(e) = self
-            .storage
-            .save_nostr_event(&event.id.to_hex(), event.as_json().as_bytes())
-            .await
-        {
-            warn!(error = %e, "Failed to persist Nostr event to storage");
-        }
+        Ok(true)
     }
 
     /// Build a CMN Nostr event from a raw manifest (pulse payload).
@@ -283,10 +292,10 @@ impl NostrBridge {
         let event = EventBuilder::new(Kind::Custom(CMN_EVENT_KIND), &content)
             .tag(Tag::identifier(uri))
             .tag(Tag::hashtag(t_value))
-            .tag(Tag::custom(TagKind::custom("domain"), [domain.as_str()]))
-            .tag(Tag::custom(TagKind::custom("uri"), [uri]))
-            .tag(Tag::custom(TagKind::custom("hash"), [hash]))
-            .sign_with_keys(&self.keys)
+            .tag(Tag::custom("domain", [domain.as_str()]))
+            .tag(Tag::custom("uri", [uri]))
+            .tag(Tag::custom("hash", [hash]))
+            .finalize(&self.keys)
             .map_err(|e| anyhow!("Failed to sign Nostr event: {}", e))?;
 
         Ok(event)
@@ -302,7 +311,7 @@ impl NostrBridge {
         let event = self.build_event(pulse_json)?;
 
         // Store locally for relay serving and persist to database
-        self.store_event(&event).await;
+        self.store_event(&event).await?;
 
         // Publish via the long-lived client
         if let Some(ref client) = self.forward_client {
@@ -343,7 +352,9 @@ impl NostrBridge {
             "Starting Nostr subscription listener"
         );
 
-        let client = Client::builder().signer(self.keys.clone()).build();
+        let client = Client::builder()
+            .authenticator(SignerAuthenticator::new(self.keys.clone()))
+            .build();
 
         for relay_url in &self.relays {
             if let Err(e) = client.add_relay(relay_url).await {
@@ -361,10 +372,10 @@ impl NostrBridge {
 
         let mut notifications = client.notifications();
 
-        match client.subscribe(filter, None).await {
+        match client.subscribe(filter).await {
             Ok(output) => {
                 info!(
-                    subscription_id = %output.val,
+                    subscription_id = %output.value,
                     success_count = output.success.len(),
                     failed_count = output.failed.len(),
                     "Nostr subscription active, listening for CMN events"
@@ -377,32 +388,33 @@ impl NostrBridge {
 
         loop {
             tokio::select! {
-                result = notifications.recv() => {
-                    match result {
-                        Ok(RelayPoolNotification::Event { event, .. }) => {
-                            // Store the raw event for relay serving and persist
-                            self.store_event(&event).await;
-
-                            // Process the CMN content (unified ingest pipeline)
+                notification = notifications.next() => {
+                    match notification {
+                        Some(ClientNotification::Event { event, .. }) => {
+                            // Verify CMN content before adding it to relay history.
                             if let Err(e) = process_cmn_event(&event, &state, self.max_body_bytes, state.config.pulse.max_clock_skew_s * 1000, state.config.pulse.max_taste_clock_skew_s * 1000).await {
                                 warn!(
                                     event_id = %event.id.to_hex(),
                                     error = %e,
                                     "Failed to process CMN event"
                                 );
+                                continue;
+                            }
+                            match self.store_event(&event).await {
+                                Ok(true) => {
+                                    if let Some(relay) = &state.nostr_relay {
+                                        let _ = relay.event_tx.send(*event);
+                                    }
+                                }
+                                Ok(false) => {}
+                                Err(error) => warn!(error = %error, "Failed to persist verified Nostr event"),
                             }
                         }
-                        Ok(_) => {
+                        Some(_) => {
                             // Ignore non-event notifications (Message, Shutdown, etc.)
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            warn!(
-                                missed_count = n,
-                                "Notification channel lagged, some events may be missed"
-                            );
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                            warn!("Notification channel closed");
+                        None => {
+                            warn!("Notification stream closed");
                             break;
                         }
                     }
@@ -451,6 +463,41 @@ async fn process_cmn_event(
     max_clock_skew_ms: u64,
     max_taste_clock_skew_ms: u64,
 ) -> Result<()> {
+    let pulse = verify_cmn_event(
+        event,
+        state,
+        max_body_bytes,
+        max_clock_skew_ms,
+        max_taste_clock_skew_ms,
+    )
+    .await?;
+    match crate::ingest::store(
+        state,
+        &pulse,
+        &crate::ingest::StoreOptions {
+            forward_nostr: false,
+        },
+    )
+    .await
+    {
+        Ok(_) | Err(crate::ingest::StoreError::VersionNotNewer { .. }) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Validate transport and CMN signatures without treating duplicates or old versions as invalid.
+pub async fn verify_cmn_event(
+    event: &Event,
+    state: &crate::handlers::AppState,
+    max_body_bytes: usize,
+    max_clock_skew_ms: u64,
+    max_taste_clock_skew_ms: u64,
+) -> Result<crate::ingest::VerifiedPulse> {
+    anyhow::ensure!(
+        event.kind == Kind::Custom(CMN_EVENT_KIND),
+        "Not a CMN event kind"
+    );
+    event.verify()?;
     // Reject non-CMN events (NIP-78 is shared by all apps)
     let is_cmn = event.tags.iter().any(|tag| {
         tag.as_slice().first().map(|s| s.as_str()) == Some("t")
@@ -460,7 +507,7 @@ async fn process_cmn_event(
             )
     });
     if !is_cmn {
-        return Ok(());
+        anyhow::bail!("Missing CMN event tag");
     }
 
     // Reject oversized event content (same limit as HTTP body)
@@ -487,17 +534,76 @@ async fn process_cmn_event(
         state.config.debug,
     )
     .await
-    .map_err(|e| anyhow!("{}", e))?;
+    .map_err(anyhow::Error::new)?;
 
-    // Unified storage pipeline (forward_nostr=false to prevent loops)
-    crate::ingest::store(
-        state,
-        &pulse,
-        &crate::ingest::StoreOptions {
-            forward_nostr: false,
+    if pulse.host_key_source.is_fallback()
+        || pulse
+            .author_key_source
+            .is_some_and(crate::cmn_cache::KeySource::is_fallback)
+    {
+        return Err(crate::ingest::IngestError::KeyFetchFailed {
+            domain: pulse.domain.clone(),
+            error: "Fresh domain verification is unavailable".to_string(),
+        }
+        .into());
+    }
+
+    Ok(pulse)
+}
+
+/// Explicit offline cleanup: retain only event content represented by verified CMN storage.
+pub async fn prune_unbacked_nostr_events<S: Storage>(storage: &S) -> Result<(usize, usize)> {
+    let events = storage.get_nostr_event_records().await?;
+    let mut removed_ids = Vec::new();
+    let mut retained_count = 0;
+    for (id, bytes) in events {
+        let matches = match Event::from_json(&bytes) {
+            Ok(event)
+                if event.id.to_hex() == id
+                    && event.verify().is_ok()
+                    && event.kind == Kind::Custom(CMN_EVENT_KIND) =>
+            {
+                match substrate::client::json_from_slice_reject_duplicates(
+                    event.content.as_bytes(),
+                    "stored Nostr content",
+                ) {
+                    Ok(payload) => content_is_stored(storage, &payload).await?,
+                    Err(_) => false,
+                }
+            }
+            _ => false,
+        };
+        if matches {
+            retained_count += 1;
+        } else {
+            removed_ids.push(id);
+        }
+    }
+    storage.mutate_nostr_events(None, &removed_ids).await?;
+    Ok((retained_count, removed_ids.len()))
+}
+
+async fn content_is_stored<S: Storage>(storage: &S, payload: &Value) -> Result<bool> {
+    let Some(uri) = payload.pointer("/capsule/uri").and_then(Value::as_str) else {
+        return Ok(false);
+    };
+    let Ok(parsed) = substrate::parse_uri(uri) else {
+        return Ok(false);
+    };
+    let data = match parsed.kind {
+        substrate::CmnUriKind::Spore => match parsed.hash.as_deref() {
+            Some(hash) => storage.get_spore_on_host(&parsed.domain, hash).await?,
+            None => None,
         },
-    )
-    .await?;
-
-    Ok(())
+        substrate::CmnUriKind::Mycelium => storage.get_mycelium(&parsed.domain).await?,
+        substrate::CmnUriKind::Taste => match parsed.hash.as_deref() {
+            Some(hash) => storage.get_taste_by_hash(hash).await?,
+            None => None,
+        },
+        _ => None,
+    };
+    Ok(data
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .as_ref()
+        == Some(payload))
 }

@@ -4,8 +4,8 @@ use super::{EmbedClient, Search, SearchQuery, SearchResult};
 use crate::config::SearchConfig;
 use anyhow::Result;
 use async_trait::async_trait;
-use ruvector_core::types::{DbOptions, DistanceMetric, SearchQuery as RvSearchQuery, VectorEntry};
 use ruvector_core::VectorDB;
+use ruvector_core::types::{DbOptions, DistanceMetric, SearchQuery as RvSearchQuery, VectorEntry};
 use serde_json::Value;
 
 pub struct RuvectorSearch {
@@ -139,6 +139,9 @@ impl Search for RuvectorSearch {
     }
 
     async fn search(&self, query: &SearchQuery) -> Result<Vec<SearchResult>> {
+        let base = query
+            .checked_fetch_count()
+            .ok_or_else(|| anyhow::anyhow!("Search pagination range is too large"))?;
         let query_embeddings = self.embedder.embed(&[&query.text]).await?;
         let query_vec = query_embeddings
             .into_iter()
@@ -146,13 +149,12 @@ impl Search for RuvectorSearch {
             .ok_or_else(|| anyhow::anyhow!("No embedding returned for query"))?;
 
         // Over-fetch to cover offset + pagination probe (+1) + post-filtering
-        let base = query.offset + query.limit + 1;
         let needs_post_filter = !query.bonds.is_empty()
             || query.strain.is_some()
             || query.updated_after.is_some()
             || query.updated_before.is_some();
         let fetch_limit = if needs_post_filter {
-            (base * 10).min(500)
+            base.saturating_mul(10).min(500)
         } else {
             base
         };
@@ -203,15 +205,15 @@ impl Search for RuvectorSearch {
                         .and_then(|m| m.get("updated_at_epoch_ms"))
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0);
-                    if let Some(after_ms) = query.updated_after {
-                        if updated_ms < after_ms {
-                            return None;
-                        }
+                    if let Some(after_ms) = query.updated_after
+                        && updated_ms < after_ms
+                    {
+                        return None;
                     }
-                    if let Some(before_ms) = query.updated_before {
-                        if updated_ms > before_ms {
-                            return None;
-                        }
+                    if let Some(before_ms) = query.updated_before
+                        && updated_ms > before_ms
+                    {
+                        return None;
                     }
                 }
 

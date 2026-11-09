@@ -1,6 +1,6 @@
+use super::AppState;
 use super::common::{build_taste_response, taste_limit};
 use super::response::{self, ApiResult};
-use super::AppState;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use std::sync::Arc;

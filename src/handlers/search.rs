@@ -1,5 +1,5 @@
-use super::response::{self, ApiResult};
 use super::AppState;
+use super::response::{self, ApiResult};
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use serde::Deserialize;
@@ -110,6 +110,13 @@ pub async fn handle_search(
         limit,
         offset,
     };
+    if query.checked_fetch_count().is_none() {
+        return response::error(
+            StatusCode::BAD_REQUEST,
+            "cursor_invalid",
+            "Cursor offset is too large for the requested page",
+        );
+    }
 
     match search.search(&query).await {
         Ok(results) => {
@@ -138,10 +145,10 @@ pub async fn handle_search(
                     "verdicts": verdicts,
                 });
                 // Remove null verdicts (no taste data)
-                if verdicts.is_null() {
-                    if let Some(obj) = entry.as_object_mut() {
-                        obj.remove("verdicts");
-                    }
+                if verdicts.is_null()
+                    && let Some(obj) = entry.as_object_mut()
+                {
+                    obj.remove("verdicts");
                 }
                 spores.push(entry);
             }

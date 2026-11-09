@@ -7,7 +7,7 @@ use super::{
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -77,6 +77,45 @@ struct MyceliumRecord {
 }
 
 impl RedbStorage {
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn remove_test_table(&self, name: &str) -> Result<()> {
+        let transaction = self.db.begin_write()?;
+        match name {
+            "spores" => {
+                transaction.delete_table(SPORES)?;
+            }
+            "domains" => {
+                transaction.delete_table(DOMAINS)?;
+            }
+            "mycelia" => {
+                transaction.delete_table(MYCELIA)?;
+            }
+            _ => anyhow::bail!("Unknown test table"),
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn retry_record(&self, domain: &str) -> Result<Option<(String, i32, bool, bool)>> {
+        let transaction = self.db.begin_read()?;
+        let table = transaction.open_table(MYCELIA)?;
+        table
+            .get(domain)?
+            .map(|value| {
+                let record: MyceliumRecord = serde_json::from_slice(value.value())?;
+                Ok((
+                    record.status,
+                    record.retry_count,
+                    record.last_error.is_some(),
+                    record.next_retry_at_epoch_s.is_some(),
+                ))
+            })
+            .transpose()
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let db = Database::create(path)?;
 
@@ -260,33 +299,31 @@ impl RedbStorage {
             match direction {
                 BfsDirection::Inbound => {
                     // Inbound: who points to me (children from INBOUND table)
-                    if let Some(ref table) = inbound_table {
-                        if let Some(children_value) = table.get(current.as_str())? {
-                            for child in children_value.value() {
-                                let child_hash = child.to_string();
-                                if !visited.contains(&child_hash) {
-                                    queue.push_back((child_hash.clone(), depth + 1));
-                                    depth_tracker.insert(child_hash, depth + 1);
-                                }
+                    if let Some(ref table) = inbound_table
+                        && let Some(children_value) = table.get(current.as_str())?
+                    {
+                        for child in children_value.value() {
+                            let child_hash = child.to_string();
+                            if !visited.contains(&child_hash) {
+                                queue.push_back((child_hash.clone(), depth + 1));
+                                depth_tracker.insert(child_hash, depth + 1);
                             }
                         }
                     }
                 }
                 BfsDirection::Outbound => {
                     // Outbound: who do I point to (refs from SPORE_REFS table)
-                    if let Some(refs_data) = spore_refs_table.get(current.as_str())? {
-                        if let Ok(refs) =
+                    if let Some(refs_data) = spore_refs_table.get(current.as_str())?
+                        && let Ok(refs) =
                             serde_json::from_slice::<Vec<serde_json::Value>>(refs_data.value())
-                        {
-                            for ref_obj in &refs {
-                                if let Some(ref_uri) = ref_obj.get("uri").and_then(|u| u.as_str()) {
-                                    if let Some((_, ref_hash)) = parse_cmn_uri(ref_uri) {
-                                        if !visited.contains(&ref_hash) {
-                                            queue.push_back((ref_hash.clone(), depth + 1));
-                                            depth_tracker.insert(ref_hash, depth + 1);
-                                        }
-                                    }
-                                }
+                    {
+                        for ref_obj in &refs {
+                            if let Some(ref_uri) = ref_obj.get("uri").and_then(|u| u.as_str())
+                                && let Some((_, ref_hash)) = parse_cmn_uri(ref_uri)
+                                && !visited.contains(&ref_hash)
+                            {
+                                queue.push_back((ref_hash.clone(), depth + 1));
+                                depth_tracker.insert(ref_hash, depth + 1);
                             }
                         }
                     }
@@ -312,19 +349,18 @@ impl RedbStorage {
                     let uri = format!("cmn://{}/{}", domain, visited_hash);
 
                     let mut refs = Vec::new();
-                    if let Some(refs_data) = spore_refs_table.get(visited_hash.as_str())? {
-                        if let Ok(raw_refs) =
+                    if let Some(refs_data) = spore_refs_table.get(visited_hash.as_str())?
+                        && let Ok(raw_refs) =
                             serde_json::from_slice::<Vec<serde_json::Value>>(refs_data.value())
-                        {
-                            for ref_obj in &raw_refs {
-                                let ref_uri = ref_obj.get("uri").and_then(|u| u.as_str());
-                                let ref_type = ref_obj.get("relation").and_then(|t| t.as_str());
-                                if let (Some(u), Some(r)) = (ref_uri, ref_type) {
-                                    refs.push(LineageRef {
-                                        relation: r.to_string(),
-                                        uri: u.to_string(),
-                                    });
-                                }
+                    {
+                        for ref_obj in &raw_refs {
+                            let ref_uri = ref_obj.get("uri").and_then(|u| u.as_str());
+                            let ref_type = ref_obj.get("relation").and_then(|t| t.as_str());
+                            if let (Some(u), Some(r)) = (ref_uri, ref_type) {
+                                refs.push(LineageRef {
+                                    relation: r.to_string(),
+                                    uri: u.to_string(),
+                                });
                             }
                         }
                     }
@@ -458,6 +494,13 @@ impl Storage for RedbStorage {
         }
     }
 
+    async fn get_spore_on_host(&self, domain: &str, hash: &str) -> Result<Option<Vec<u8>>> {
+        let transaction = self.db.begin_read()?;
+        let table = transaction.open_table(SPORES)?;
+        let key = format!("{domain}:{hash}");
+        Ok(table.get(key.as_str())?.map(|value| value.value().to_vec()))
+    }
+
     async fn save_mycelium(
         &self,
         domain: &str,
@@ -489,10 +532,42 @@ impl Storage for RedbStorage {
         let write_txn = self.db.begin_write()?;
         {
             let mut table = write_txn.open_table(MYCELIA)?;
+            let old_record: Option<MyceliumRecord> = table
+                .get(domain)?
+                .map(|v| serde_json::from_slice(v.value()))
+                .transpose()?;
+
             table.insert(domain, record_bytes.as_slice())?;
 
             // Maintain mycelium hash reverse index
             let mut hash_idx = write_txn.open_table(MYCELIA_HASH_INDEX)?;
+
+            // Remove domain from old hash entries if old record had a different hash
+            if let Some(old) = old_record
+                && old.hash != hash
+            {
+                let mut old_hashes: Vec<&str> = old.hash.split(',').collect();
+                if old_hashes.len() > 1 {
+                    old_hashes.push(&old.hash);
+                }
+                for old_h in old_hashes {
+                    let maybe_domains: Option<Vec<String>> = hash_idx
+                        .get(old_h)?
+                        .map(|v| v.value().iter().map(|s| s.to_string()).collect());
+                    if let Some(mut domains) = maybe_domains
+                        && let Some(pos) = domains.iter().position(|d| d == domain)
+                    {
+                        domains.remove(pos);
+                        if domains.is_empty() {
+                            hash_idx.remove(old_h)?;
+                        } else {
+                            let refs: Vec<&str> = domains.iter().map(|s| s.as_str()).collect();
+                            hash_idx.insert(old_h, refs)?;
+                        }
+                    }
+                }
+            }
+
             // Index each shard hash individually (comma-separated) plus the full key
             let shard_hashes: Vec<&str> = hash.split(',').collect();
             for shard_hash in &shard_hashes {
@@ -574,7 +649,7 @@ impl Storage for RedbStorage {
         match table.get(domain)? {
             Some(v) => {
                 let record: MyceliumRecord = serde_json::from_slice(v.value())?;
-                if record.status == "synced" && !record.data.is_empty() {
+                if !record.data.is_empty() {
                     Ok(Some(record.data))
                 } else {
                     Ok(None)
@@ -710,7 +785,7 @@ impl Storage for RedbStorage {
         match table.get(domain)? {
             Some(data) => {
                 let record: MyceliumRecord = serde_json::from_slice(data.value())?;
-                if record.status == "synced" {
+                if !record.data.is_empty() && !record.hash.is_empty() {
                     Ok(Some(record.hash))
                 } else {
                     Ok(None)
@@ -730,8 +805,8 @@ impl Storage for RedbStorage {
             let (domain, data) = item?;
             let record: MyceliumRecord = serde_json::from_slice(data.value())?;
 
-            // Only include successfully synced myceliums
-            if record.status == "synced" {
+            // Keep verified manifests visible while missing content is retried.
+            if !record.data.is_empty() && !record.hash.is_empty() {
                 result.push(MyceliumRow {
                     domain: domain.value().to_string(),
                     hash: record.hash,
@@ -792,6 +867,82 @@ impl Storage for RedbStorage {
             events.push(value.value().to_vec());
         }
         Ok(events)
+    }
+
+    async fn get_nostr_event_records(&self) -> Result<Vec<(String, Vec<u8>)>> {
+        let transaction = self.db.begin_read()?;
+        let table = match transaction.open_table(NOSTR_EVENTS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(vec![]),
+            Err(error) => return Err(error.into()),
+        };
+        table
+            .iter()?
+            .map(|entry| {
+                let (id, bytes) = entry?;
+                Ok((id.value().to_string(), bytes.value().to_vec()))
+            })
+            .collect()
+    }
+
+    async fn mutate_nostr_events(
+        &self,
+        event: Option<(&str, &[u8])>,
+        removed_ids: &[String],
+    ) -> Result<()> {
+        let transaction = self.db.begin_write()?;
+        {
+            let mut table = transaction.open_table(NOSTR_EVENTS)?;
+            for id in removed_ids {
+                table.remove(id.as_str())?;
+            }
+            if let Some((id, json)) = event {
+                table.insert(id, json)?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    async fn trim_nostr_events(&self, max_events: usize) -> Result<()> {
+        anyhow::ensure!(max_events > 0, "Nostr capacity must be greater than zero");
+        let transaction = self.db.begin_write()?;
+        {
+            let mut table = transaction.open_table(NOSTR_EVENTS)?;
+            let excess = table.len()?.saturating_sub(max_events as u64);
+            let ids = table
+                .iter()?
+                .take(excess as usize)
+                .map(|entry| entry.map(|(id, _)| id.value().to_string()))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            for id in ids {
+                table.remove(id.as_str())?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    async fn mark_mycelium_synced(&self, domain: &str) -> Result<()> {
+        let transaction = self.db.begin_write()?;
+        {
+            let mut table = transaction.open_table(MYCELIA)?;
+            let bytes = table.get(domain)?.map(|value| value.value().to_vec());
+            if let Some(bytes) = bytes {
+                let mut record: MyceliumRecord = serde_json::from_slice(&bytes)?;
+                record.status = "synced".to_string();
+                record.retry_count = 0;
+                record.last_error = None;
+                record.next_retry_at_epoch_s = None;
+                if record.data.is_empty() {
+                    table.remove(domain)?;
+                } else {
+                    table.insert(domain, serde_json::to_vec(&record)?.as_slice())?;
+                }
+            }
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     async fn save_taste(&self, target_uri: &str, domain: &str, data: &[u8]) -> Result<()> {
@@ -857,23 +1008,23 @@ impl Storage for RedbStorage {
         let read_txn = self.db.begin_read()?;
 
         // Try the spore taste index first (O(log N) lookup)
-        if let Ok(idx) = read_txn.open_table(TASTE_SPORE_INDEX) {
-            if let Some(keys_value) = idx.get(spore_hash.as_str())? {
-                let keys: Vec<String> = keys_value.value().iter().map(|s| s.to_string()).collect();
-                if !keys.is_empty() {
-                    let table = match read_txn.open_table(TASTE_REPORTS) {
-                        Ok(t) => t,
-                        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(vec![]),
-                        Err(e) => return Err(e.into()),
-                    };
-                    let mut tastes = Vec::new();
-                    for key in &keys {
-                        if let Some(value) = table.get(key.as_str())? {
-                            tastes.push(value.value().to_vec());
-                        }
+        if let Ok(idx) = read_txn.open_table(TASTE_SPORE_INDEX)
+            && let Some(keys_value) = idx.get(spore_hash.as_str())?
+        {
+            let keys: Vec<String> = keys_value.value().iter().map(|s| s.to_string()).collect();
+            if !keys.is_empty() {
+                let table = match read_txn.open_table(TASTE_REPORTS) {
+                    Ok(t) => t,
+                    Err(redb::TableError::TableDoesNotExist(_)) => return Ok(vec![]),
+                    Err(e) => return Err(e.into()),
+                };
+                let mut tastes = Vec::new();
+                for key in &keys {
+                    if let Some(value) = table.get(key.as_str())? {
+                        tastes.push(value.value().to_vec());
                     }
-                    return Ok(tastes);
                 }
+                return Ok(tastes);
             }
         }
 
@@ -948,30 +1099,32 @@ impl Storage for RedbStorage {
         let read_txn = self.db.begin_read()?;
 
         // Try the reverse index first
-        if let Ok(idx) = read_txn.open_table(MYCELIA_HASH_INDEX) {
-            if let Some(domains_value) = idx.get(hash)? {
-                let domains: Vec<String> = domains_value
-                    .value()
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect();
-                if !domains.is_empty() {
-                    let mycelia_table = read_txn.open_table(MYCELIA)?;
-                    let mut result = Vec::new();
-                    for domain in &domains {
-                        if let Some(data) = mycelia_table.get(domain.as_str())? {
-                            let record: MyceliumRecord = serde_json::from_slice(data.value())?;
-                            if record.status == "synced" {
-                                result.push(MyceliumRow {
-                                    domain: domain.clone(),
-                                    hash: record.hash,
-                                    updated_at_epoch_ms: record.updated_at_epoch_ms,
-                                });
-                            }
+        if let Ok(idx) = read_txn.open_table(MYCELIA_HASH_INDEX)
+            && let Some(domains_value) = idx.get(hash)?
+        {
+            let domains: Vec<String> = domains_value
+                .value()
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            if !domains.is_empty() {
+                let mycelia_table = read_txn.open_table(MYCELIA)?;
+                let mut result = Vec::new();
+                for domain in &domains {
+                    if let Some(data) = mycelia_table.get(domain.as_str())? {
+                        let record: MyceliumRecord = serde_json::from_slice(data.value())?;
+                        if record.status == "synced"
+                            && (record.hash == hash || record.hash.split(',').any(|h| h == hash))
+                        {
+                            result.push(MyceliumRow {
+                                domain: domain.clone(),
+                                hash: record.hash,
+                                updated_at_epoch_ms: record.updated_at_epoch_ms,
+                            });
                         }
                     }
-                    return Ok(result);
                 }
+                return Ok(result);
             }
         }
 

@@ -23,7 +23,7 @@ use storage::PostgresStorage;
 #[cfg(feature = "redb")]
 use storage::RedbStorage;
 use storage::{Storage, StorageBackend};
-use tracing::{error, info, info_span, warn, Instrument};
+use tracing::{Instrument, error, info, info_span, warn};
 use tracing_subscriber::EnvFilter;
 
 use handlers::AppState;
@@ -74,11 +74,18 @@ async fn run(args: cli::Args) -> Result<(), ServiceError> {
             "inspect the configured file with afdata, correct it, and retry",
         )
     })?;
-    let raw_config = serde_json::to_value(&loaded_config).map_err(|_| {
+    let raw_yaml = std::fs::read_to_string(&args.config).map_err(|_| {
         ServiceError::new(
-            "config_serialize_failed",
-            "Failed to prepare the validated configuration for structured logging",
-            "check the configuration value types and retry",
+            "config_read_failed",
+            "Failed to read the Synapse configuration file",
+            "check that the configuration file exists and is readable, then retry",
+        )
+    })?;
+    let raw_config = parse_startup_config(&raw_yaml).map_err(|_| {
+        ServiceError::new(
+            "config_parse_failed",
+            "Failed to parse the Synapse configuration as YAML",
+            "inspect the configured file with afdata, correct syntax or formatting, and retry",
         )
     })?;
     let cfg = Arc::new(loaded_config);
@@ -197,6 +204,32 @@ async fn run(args: cli::Args) -> Result<(), ServiceError> {
         }
     };
 
+    if args.prune_nostr {
+        #[cfg(feature = "nostr")]
+        {
+            let (retained_count, removed_count) = nostr::prune_unbacked_nostr_events(&storage)
+                .await
+                .map_err(|_| {
+                    ServiceError::new(
+                        "nostr_cleanup_failed",
+                        "Failed to clean relay history",
+                        "verify storage availability and retry --prune-nostr",
+                    )
+                })?;
+            info!(
+                retained_count,
+                removed_count, "Nostr history cleanup complete"
+            );
+            return Ok(());
+        }
+        #[cfg(not(feature = "nostr"))]
+        return Err(ServiceError::new(
+            "nostr_backend_unavailable",
+            "Nostr cleanup is not compiled into this binary",
+            "install a build with the nostr feature",
+        ));
+    }
+
     // Crawler is created after search init so it can receive the search engine
     // (moved below)
 
@@ -211,7 +244,7 @@ async fn run(args: cli::Args) -> Result<(), ServiceError> {
                     Ok(bridge) => {
                         let bridge = Arc::new(bridge);
                         let (event_tx, _) =
-                            tokio::sync::broadcast::channel::<nostr_sdk::Event>(256);
+                            tokio::sync::broadcast::channel::<nostr_sdk::prelude::Event>(256);
                         let relay_state = Arc::new(relay::RelayState {
                             event_tx,
                             bridge,
@@ -222,7 +255,11 @@ async fn run(args: cli::Args) -> Result<(), ServiceError> {
                     }
                     Err(e) => {
                         error!(error = %e, "Failed to initialize Nostr bridge");
-                        None
+                        return Err(ServiceError::new(
+                            "nostr_init_failed",
+                            "Failed to initialize Nostr relay history",
+                            "verify storage availability, Nostr capacity and key storage, then retry",
+                        ));
                     }
                 }
             } else {
@@ -298,8 +335,19 @@ async fn run(args: cli::Args) -> Result<(), ServiceError> {
     if args.rebuild_search {
         match &search {
             Some(search_engine) => {
-                rebuild_search(&storage, search_engine).await;
-                info!("Search rebuild complete, exiting");
+                let statistics = search::rebuild_search(&storage, search_engine.as_ref()).await;
+                info!(
+                    indexed_count = statistics.indexed_count,
+                    failed_count = statistics.failed_count,
+                    "Search rebuild complete"
+                );
+                if statistics.failed_count > 0 {
+                    return Err(ServiceError::new(
+                        "search_rebuild_failed",
+                        "Search rebuild was incomplete",
+                        "inspect indexed_count and failed_count in the logs, correct storage or embedding failures, then rerun",
+                    ));
+                }
                 return Ok(());
             }
             None => {
@@ -355,7 +403,7 @@ async fn run(args: cli::Args) -> Result<(), ServiceError> {
         let _ = relay_state.app_state.set(state.clone());
     }
 
-    // Create API router (includes /nostr WebSocket endpoint if configured)
+    // Create API router (includes /synapse/nostr WebSocket endpoint if configured)
     let app = handlers::create_router(state.clone());
 
     // Determine which servers to start
@@ -385,106 +433,106 @@ async fn run(args: cli::Args) -> Result<(), ServiceError> {
     let mut handles = Vec::new();
 
     // HTTP server
-    if let Some(ref http_cfg) = cfg.http {
-        if http_cfg.enabled {
-            let http_addr: SocketAddr = http_cfg.address.parse().map_err(|_| {
-                ServiceError::new(
-                    "http_address_invalid",
-                    "The configured HTTP listen address is invalid",
-                    "set http.address to a valid socket address and retry",
-                )
-            })?;
-            let http_shutdown_rx = shutdown_tx.subscribe();
+    if let Some(ref http_cfg) = cfg.http
+        && http_cfg.enabled
+    {
+        let http_addr: SocketAddr = http_cfg.address.parse().map_err(|_| {
+            ServiceError::new(
+                "http_address_invalid",
+                "The configured HTTP listen address is invalid",
+                "set http.address to a valid socket address and retry",
+            )
+        })?;
+        let http_shutdown_rx = shutdown_tx.subscribe();
 
-            if https_enabled {
-                // HTTP redirects to HTTPS
-                handles.push(tokio::spawn(async move {
-                    let redirect_app = http::create_redirect_router();
-                    http::run_server(http_addr, redirect_app, http_shutdown_rx).await
-                }));
-            } else {
-                // HTTP serves API directly (debug mode)
-                let http_app = app.clone();
-                handles.push(tokio::spawn(async move {
-                    http::run_server(http_addr, http_app, http_shutdown_rx).await
-                }));
-            }
+        if https_enabled {
+            // HTTP redirects to HTTPS
+            handles.push(tokio::spawn(async move {
+                let redirect_app = http::create_redirect_router();
+                http::run_server(http_addr, redirect_app, http_shutdown_rx).await
+            }));
+        } else {
+            // HTTP serves API directly (debug mode)
+            let http_app = app.clone();
+            handles.push(tokio::spawn(async move {
+                http::run_server(http_addr, http_app, http_shutdown_rx).await
+            }));
         }
     }
 
     // HTTPS server
-    if let Some(ref https_cfg) = cfg.https {
-        if https_cfg.enabled {
-            let https_addr: SocketAddr = https_cfg.address.parse().map_err(|_| {
-                ServiceError::new(
-                    "https_address_invalid",
-                    "The configured HTTPS listen address is invalid",
-                    "set https.address to a valid socket address and retry",
+    if let Some(ref https_cfg) = cfg.https
+        && https_cfg.enabled
+    {
+        let https_addr: SocketAddr = https_cfg.address.parse().map_err(|_| {
+            ServiceError::new(
+                "https_address_invalid",
+                "The configured HTTPS listen address is invalid",
+                "set https.address to a valid socket address and retry",
+            )
+        })?;
+        let domains = https_cfg.domains.clone();
+        let https_app = app.clone();
+        let https_storage = state.storage.clone();
+        let acme_mode = https_cfg.acme.mode.clone();
+        let https_shutdown_rx = shutdown_tx.subscribe();
+
+        let cert_domains: Vec<String> = if domains.is_empty() {
+            vec!["localhost".to_string()]
+        } else {
+            domains.clone()
+        };
+
+        if acme_mode == "self" {
+            let self_signed_days = https_cfg.self_signed_validity_days;
+            handles.push(tokio::spawn(async move {
+                https::run_server_self_signed(
+                    https_addr,
+                    &https_storage,
+                    &cert_domains,
+                    self_signed_days,
+                    https_app,
+                    https_shutdown_rx,
                 )
-            })?;
-            let domains = https_cfg.domains.clone();
-            let https_app = app.clone();
-            let https_storage = state.storage.clone();
-            let acme_mode = https_cfg.acme.mode.clone();
-            let https_shutdown_rx = shutdown_tx.subscribe();
-
-            let cert_domains: Vec<String> = if domains.is_empty() {
-                vec!["localhost".to_string()]
-            } else {
-                domains.clone()
+                .await
+            }));
+        } else {
+            let acme_cfg = config::AcmeConfig {
+                contact: https_cfg.acme.contact.clone(),
+                mode: https_cfg.acme.mode.clone(),
+                renewal_before_days: https_cfg.acme.renewal_before_days,
             };
-
-            if acme_mode == "self" {
-                let self_signed_days = https_cfg.self_signed_validity_days;
-                handles.push(tokio::spawn(async move {
-                    https::run_server_self_signed(
-                        https_addr,
-                        &https_storage,
-                        &cert_domains,
-                        self_signed_days,
-                        https_app,
-                        https_shutdown_rx,
-                    )
-                    .await
-                }));
-            } else {
-                let acme_cfg = config::AcmeConfig {
-                    contact: https_cfg.acme.contact.clone(),
-                    mode: https_cfg.acme.mode.clone(),
-                    renewal_before_days: https_cfg.acme.renewal_before_days,
-                };
-                let renewal_days = https_cfg.acme.renewal_before_days;
-                handles.push(tokio::spawn(async move {
-                    https::run_server_acme(
-                        https_addr,
-                        https_storage,
-                        &cert_domains,
-                        &acme_cfg,
-                        renewal_days,
-                        https_app,
-                        https_shutdown_rx,
-                    )
-                    .await
-                }));
-            }
+            let renewal_days = https_cfg.acme.renewal_before_days;
+            handles.push(tokio::spawn(async move {
+                https::run_server_acme(
+                    https_addr,
+                    https_storage,
+                    &cert_domains,
+                    &acme_cfg,
+                    renewal_days,
+                    https_app,
+                    https_shutdown_rx,
+                )
+                .await
+            }));
         }
     }
 
     // Spawn Nostr subscription listener if configured
     #[cfg(feature = "nostr")]
-    if let Some(ref relay_state) = state.nostr_relay {
-        if cfg.nostr.as_ref().is_some_and(|n| n.subscribe) {
-            let bridge = relay_state.bridge.clone();
-            let nostr_state = state.clone();
-            let nostr_shutdown_rx = shutdown_tx.subscribe();
-            handles.push(tokio::spawn(async move {
-                bridge
-                    .run_listener(nostr_state, nostr_shutdown_rx)
-                    .await
-                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })
-            }));
-            info!("Nostr subscription listener spawned");
-        }
+    if let Some(ref relay_state) = state.nostr_relay
+        && cfg.nostr.as_ref().is_some_and(|n| n.subscribe)
+    {
+        let bridge = relay_state.bridge.clone();
+        let nostr_state = state.clone();
+        let nostr_shutdown_rx = shutdown_tx.subscribe();
+        handles.push(tokio::spawn(async move {
+            bridge
+                .run_listener(nostr_state, nostr_shutdown_rx)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })
+        }));
+        info!("Nostr subscription listener spawned");
     }
 
     // Start background retry task
@@ -582,55 +630,6 @@ async fn rebuild_graph(storage: &StorageBackend, graph: &search::SporeGraph) {
 }
 
 /// Rebuild the search vector index from storage.
-/// Iterates all spores in all domains and re-embeds them.
-#[cfg(feature = "ruvector")]
-async fn rebuild_search(storage: &StorageBackend, search: &search::SearchBackend) {
-    use search::Search;
-
-    let myceliums = match storage.get_all_myceliums().await {
-        Ok(m) => m,
-        Err(e) => {
-            error!(error = %e, "Failed to get myceliums for search rebuild");
-            return;
-        }
-    };
-
-    let mut indexed = 0usize;
-    let mut failed = 0usize;
-
-    for mycelium in &myceliums {
-        let domain = &mycelium.domain;
-        let hashes = match storage.get_domain_spores(domain).await {
-            Ok(h) => h,
-            Err(e) => {
-                warn!(error = %e, domain = %domain, "Failed to get spores for domain");
-                continue;
-            }
-        };
-
-        for hash in &hashes {
-            if let Ok(Some(data)) = storage.get_spore(hash).await {
-                if let Ok(spore) = serde_json::from_slice::<serde_json::Value>(&data) {
-                    match search.index_spore(domain, hash, &spore).await {
-                        Ok(()) => indexed += 1,
-                        Err(e) => {
-                            warn!(error = %e, hash = %hash, "Failed to index spore");
-                            failed += 1;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    info!(
-        indexed_count = indexed,
-        failed_count = failed,
-        domain_count = myceliums.len(),
-        "Search rebuild complete"
-    );
-}
-
 /// Extract SporeBonds from stored spore data via substrate::Spore.
 #[cfg(feature = "ruvector")]
 fn parse_spore_references(data: &[u8]) -> Vec<storage::SporeBond> {
@@ -698,11 +697,10 @@ async fn mycelium_retry_loop(
                             };
 
                             // Skip if not enough real time has elapsed since last attempt
-                            if let Some((_, last_attempt)) = retry_state.get(&domain) {
-                                if last_attempt.elapsed().as_secs() < effective_delay {
+                            if let Some((_, last_attempt)) = retry_state.get(&domain)
+                                && last_attempt.elapsed().as_secs() < effective_delay {
                                     continue;
                                 }
-                            }
 
                             let span = info_span!("retry", domain = %domain, retries = retries, delay_s = effective_delay);
                             let success = async {
@@ -714,13 +712,6 @@ async fn mycelium_retry_loop(
                                     }
                                     Err(e) => {
                                         warn!(error = %e, "Failed to sync");
-                                        if let Err(mark_err) = state
-                                            .storage
-                                            .mark_mycelium_failed(&domain, &e.to_string())
-                                            .await
-                                        {
-                                            error!(error = %mark_err, "Failed to mark as failed");
-                                        }
                                         false
                                     }
                                 }
@@ -761,12 +752,12 @@ fn redact_legacy_config_urls(value: &mut serde_json::Value) {
                     if let serde_json::Value::String(raw_url) = field {
                         *raw_url = agent_first_data::redact_url_secrets(raw_url);
                     }
-                } else if name == "relays" {
-                    if let serde_json::Value::Array(relays) = field {
-                        for relay in relays {
-                            if let serde_json::Value::String(relay_url) = relay {
-                                *relay_url = agent_first_data::redact_url_secrets(relay_url);
-                            }
+                } else if name == "relays"
+                    && let serde_json::Value::Array(relays) = field
+                {
+                    for relay in relays {
+                        if let serde_json::Value::String(relay_url) = relay {
+                            *relay_url = agent_first_data::redact_url_secrets(relay_url);
                         }
                     }
                 }
@@ -797,6 +788,13 @@ fn startup_config_event(
     agent_first_data::json_log(payload).build()
 }
 
+fn parse_startup_config(
+    source: &str,
+) -> Result<serde_json::Value, agent_first_data::document::DocumentError> {
+    agent_first_data::document::Document::parse(source, agent_first_data::document::Format::Yaml)?
+        .decode::<serde_json::Value>()
+}
+
 /// Emit startup config as one nested event. Tracing cannot retain nested values.
 fn log_startup_config(raw_config: serde_json::Value, config_path: &str, log_format: &str) {
     let event = startup_config_event(raw_config, config_path);
@@ -815,6 +813,23 @@ fn log_startup_config(raw_config: serde_json::Value, config_path: &str, log_form
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::startup_config_event;
+
+    #[test]
+    fn startup_yaml_preserves_aliases_scalar_types_and_large_integers() -> anyhow::Result<()> {
+        let config = super::parse_startup_config(
+            "defaults: &defaults\n  limit: 18446744073709551615\ncache: *defaults\nenabled: false\nlabel: 中文\noptional:\n",
+        )?;
+        assert_eq!(config["cache"]["limit"].as_u64(), Some(u64::MAX));
+        assert_eq!(config["enabled"], false);
+        assert_eq!(config["label"], "中文");
+        assert!(config["optional"].is_null());
+        Ok(())
+    }
+
+    #[test]
+    fn startup_yaml_rejects_ambiguous_duplicate_keys() {
+        assert!(super::parse_startup_config("enabled: true\nenabled: false\n").is_err());
+    }
 
     #[test]
     fn startup_config_redacts_canonical_and_legacy_secret_boundaries() {

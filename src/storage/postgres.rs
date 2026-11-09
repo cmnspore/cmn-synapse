@@ -8,8 +8,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::Value as JsonValue;
-use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::FromRow;
+use sqlx::postgres::{PgPool, PgPoolOptions};
 use std::collections::HashMap;
 
 /// Parse CMN spore URI to extract domain and hash
@@ -39,6 +39,16 @@ struct DbTlsCert {
 }
 
 impl PostgresStorage {
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) async fn retry_record(
+        &self,
+        domain: &str,
+    ) -> Result<Option<(String, i32, bool, bool)>> {
+        Ok(sqlx::query_as("SELECT status, retry_count, last_error IS NOT NULL, next_retry_at IS NOT NULL FROM mycelia WHERE domain = $1")
+            .bind(domain).fetch_optional(&self.pool).await?)
+    }
+
     pub async fn new(database_url: &str) -> Result<Self> {
         let pool = PgPoolOptions::new()
             .max_connections(10)
@@ -191,6 +201,16 @@ impl PostgresStorage {
         .execute(&self.pool)
         .await?;
 
+        // Taste by hash index table
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS taste_by_hash (
+                taste_hash TEXT PRIMARY KEY,
+                data JSONB NOT NULL
+            )"#,
+        )
+        .execute(&self.pool)
+        .await?;
+
         Ok(())
     }
 
@@ -242,7 +262,7 @@ impl PostgresStorage {
     async fn migrate_v1_afd_renames(&self) -> Result<()> {
         // Rename mycelia.updated_at → updated_at_epoch_ms (if old column exists)
         let has_old_updated_at: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name = 'mycelia' AND column_name = 'updated_at')",
+            "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'mycelia' AND column_name = 'updated_at')",
         )
         .fetch_one(&self.pool)
         .await?;
@@ -255,7 +275,7 @@ impl PostgresStorage {
 
         // Rename tls_certs.key_pem → key_pem_secret (if old column exists)
         let has_old_key_pem: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name = 'tls_certs' AND column_name = 'key_pem')",
+            "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'tls_certs' AND column_name = 'key_pem')",
         )
         .fetch_one(&self.pool)
         .await?;
@@ -275,7 +295,7 @@ impl PostgresStorage {
     /// old rows only keyed by spore hash cannot be reliably mapped to full URI.
     async fn migrate_v2_taste_target_uri(&self) -> Result<()> {
         let has_target_uri: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name = 'taste_reports' AND column_name = 'target_uri')",
+            "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'taste_reports' AND column_name = 'target_uri')",
         )
         .fetch_one(&self.pool)
         .await?;
@@ -304,6 +324,16 @@ impl PostgresStorage {
 
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_taste_reports_kind_hash ON taste_reports(target_kind, target_hash)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Taste by hash index table
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS taste_by_hash (
+                taste_hash TEXT PRIMARY KEY,
+                data JSONB NOT NULL
+            )"#,
         )
         .execute(&self.pool)
         .await?;
@@ -470,6 +500,17 @@ impl Storage for PostgresStorage {
         }
     }
 
+    async fn get_spore_on_host(&self, domain: &str, hash: &str) -> Result<Option<Vec<u8>>> {
+        let row: Option<(JsonValue,)> =
+            sqlx::query_as("SELECT data FROM spores WHERE domain = $1 AND hash = $2")
+                .bind(domain)
+                .bind(hash)
+                .fetch_optional(&self.pool)
+                .await?;
+        row.map(|(value,)| serde_json::to_vec(&value).map_err(Into::into))
+            .transpose()
+    }
+
     async fn save_mycelium(
         &self,
         domain: &str,
@@ -549,7 +590,7 @@ impl Storage for PostgresStorage {
 
     async fn get_mycelium(&self, domain: &str) -> Result<Option<Vec<u8>>> {
         let result: Option<(Option<JsonValue>,)> =
-            sqlx::query_as("SELECT data FROM mycelia WHERE domain = $1 AND status = 'synced'")
+            sqlx::query_as("SELECT data FROM mycelia WHERE domain = $1 AND data IS NOT NULL")
                 .bind(domain)
                 .fetch_optional(&self.pool)
                 .await?;
@@ -620,8 +661,9 @@ impl Storage for PostgresStorage {
                 INNER JOIN ancestors a ON r.spore_hash = a.reference_hash
                 WHERE a.depth < $2
             )
-            SELECT DISTINCT reference_domain, reference_hash, depth
+            SELECT reference_domain, reference_hash, MIN(depth) as depth
             FROM ancestors
+            GROUP BY reference_domain, reference_hash
             ORDER BY depth, reference_domain, reference_hash
             "#,
         )
@@ -659,10 +701,11 @@ impl Storage for PostgresStorage {
                 INNER JOIN lineage l ON r.reference_hash = l.spore_hash
                 WHERE l.depth < $2
             )
-            SELECT DISTINCT s.domain, l.spore_hash, l.depth
+            SELECT s.domain, l.spore_hash, MIN(l.depth) as depth
             FROM lineage l
             INNER JOIN spores s ON s.hash = l.spore_hash
-            ORDER BY l.depth, s.domain, l.spore_hash
+            GROUP BY s.domain, l.spore_hash
+            ORDER BY depth, s.domain, l.spore_hash
             "#,
         )
         .bind(hash)
@@ -728,7 +771,7 @@ impl Storage for PostgresStorage {
 
     async fn get_mycelium_hash(&self, domain: &str) -> Result<Option<String>> {
         let result: Option<(Option<String>,)> =
-            sqlx::query_as("SELECT hash FROM mycelia WHERE domain = $1 AND status = 'synced'")
+            sqlx::query_as("SELECT hash FROM mycelia WHERE domain = $1 AND data IS NOT NULL")
                 .bind(domain)
                 .fetch_optional(&self.pool)
                 .await?;
@@ -745,7 +788,7 @@ impl Storage for PostgresStorage {
         }
 
         let rows: Vec<DbMyceliumRow> = sqlx::query_as(
-            "SELECT domain, hash, updated_at_epoch_ms FROM mycelia WHERE status = 'synced' ORDER BY updated_at_epoch_ms DESC"
+            "SELECT domain, hash, updated_at_epoch_ms FROM mycelia WHERE data IS NOT NULL ORDER BY updated_at_epoch_ms DESC"
         )
         .fetch_all(&self.pool)
         .await?;
@@ -799,7 +842,7 @@ impl Storage for PostgresStorage {
 
     async fn get_nostr_events(&self) -> Result<Vec<Vec<u8>>> {
         let rows: Vec<(JsonValue,)> =
-            sqlx::query_as("SELECT event_json FROM nostr_events ORDER BY created_at")
+            sqlx::query_as("SELECT event_json FROM nostr_events ORDER BY created_at, event_id")
                 .fetch_all(&self.pool)
                 .await?;
         let mut events = Vec::new();
@@ -807,6 +850,53 @@ impl Storage for PostgresStorage {
             events.push(serde_json::to_vec(&json_value)?);
         }
         Ok(events)
+    }
+
+    async fn get_nostr_event_records(&self) -> Result<Vec<(String, Vec<u8>)>> {
+        let rows: Vec<(String, JsonValue)> = sqlx::query_as(
+            "SELECT event_id, event_json FROM nostr_events ORDER BY created_at, event_id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(id, value)| Ok((id, serde_json::to_vec(&value)?)))
+            .collect()
+    }
+
+    async fn mutate_nostr_events(
+        &self,
+        event: Option<(&str, &[u8])>,
+        removed_ids: &[String],
+    ) -> Result<()> {
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("DELETE FROM nostr_events WHERE event_id = ANY($1)")
+            .bind(removed_ids)
+            .execute(&mut *transaction)
+            .await?;
+        if let Some((id, json)) = event {
+            let value: JsonValue = serde_json::from_slice(json)?;
+            sqlx::query("INSERT INTO nostr_events (event_id, event_json) VALUES ($1, $2) ON CONFLICT (event_id) DO NOTHING")
+                .bind(id).bind(value).execute(&mut *transaction).await?;
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn trim_nostr_events(&self, max_events: usize) -> Result<()> {
+        anyhow::ensure!(max_events > 0, "Nostr capacity must be greater than zero");
+        sqlx::query("DELETE FROM nostr_events WHERE event_id IN (SELECT event_id FROM nostr_events ORDER BY created_at DESC, event_id DESC OFFSET $1)")
+            .bind(i64::try_from(max_events)?).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    async fn mark_mycelium_synced(&self, domain: &str) -> Result<()> {
+        sqlx::query("UPDATE mycelia SET status = 'synced', retry_count = 0, last_error = NULL, next_retry_at = NULL WHERE domain = $1 AND data IS NOT NULL")
+            .bind(domain).execute(&self.pool).await?;
+        sqlx::query("DELETE FROM mycelia WHERE domain = $1 AND data IS NULL")
+            .bind(domain)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     async fn save_taste(&self, target_uri: &str, domain: &str, data: &[u8]) -> Result<()> {
@@ -817,7 +907,7 @@ impl Storage for PostgresStorage {
             substrate::CmnUriKind::Spore => ("spore", parsed.hash),
             substrate::CmnUriKind::Mycelium => ("mycelium", parsed.hash),
             substrate::CmnUriKind::Taste => {
-                return Err(anyhow::anyhow!("Taste URI cannot be used as taste target"))
+                return Err(anyhow::anyhow!("Taste URI cannot be used as taste target"));
             }
         };
 
@@ -949,5 +1039,56 @@ impl Storage for PostgresStorage {
             .fetch_one(&self.pool)
             .await?;
         Ok(count as u64)
+    }
+
+    async fn get_taste_by_hash(&self, hash: &str) -> Result<Option<Vec<u8>>> {
+        let row: Option<(JsonValue,)> =
+            sqlx::query_as("SELECT data FROM taste_by_hash WHERE taste_hash = $1")
+                .bind(hash)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(match row {
+            Some((val,)) => Some(serde_json::to_vec(&val)?),
+            None => None,
+        })
+    }
+
+    async fn save_taste_index(&self, taste_hash: &str, data: &[u8]) -> Result<()> {
+        let json_value: JsonValue = serde_json::from_slice(data)?;
+        sqlx::query(
+            r#"INSERT INTO taste_by_hash (taste_hash, data)
+               VALUES ($1, $2)
+               ON CONFLICT (taste_hash) DO UPDATE SET data = EXCLUDED.data"#,
+        )
+        .bind(taste_hash)
+        .bind(json_value)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_mycelium_by_hash(&self, hash: &str) -> Result<Vec<MyceliumRow>> {
+        #[derive(FromRow)]
+        struct DbMyceliumRow {
+            domain: String,
+            hash: String,
+            updated_at_epoch_ms: i64,
+        }
+
+        let rows: Vec<DbMyceliumRow> = sqlx::query_as(
+            "SELECT domain, hash, updated_at_epoch_ms FROM mycelia WHERE status = 'synced' AND ($1 = ANY(string_to_array(hash, ',')) OR hash = $1) ORDER BY updated_at_epoch_ms DESC"
+        )
+        .bind(hash)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| MyceliumRow {
+                domain: r.domain,
+                hash: r.hash,
+                updated_at_epoch_ms: r.updated_at_epoch_ms as u64,
+            })
+            .collect())
     }
 }

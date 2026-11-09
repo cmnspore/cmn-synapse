@@ -33,6 +33,12 @@ Run the indexer or rebuild its search vectors
 synapse [--config <PATH>]
 ```
 
+#### `prune-nostr` — Clean legacy relay history against verified CMN storage
+
+```
+synapse [--config <PATH>] --prune-nostr
+```
+
 #### `rebuild-search` — Re-embed every stored spore and exit
 
 ```
@@ -47,6 +53,7 @@ Arguments across every shape above:
 |---|---|
 | `--config` | Configuration file path |
 | `--rebuild-search` | Rebuild the search vector index from storage, then exit; requires the ruvector feature and a running embedding server |
+| `--prune-nostr` | Delete stored Nostr events whose exact content is absent from CMN storage, then exit |
 
 ## Exit codes
 
@@ -55,6 +62,7 @@ Arguments across every shape above:
 | 0 | The command ran and succeeded. |
 | 1 | The command ran and failed. The event carries a domain `error.code`. |
 | 2 | The invocation was rejected before anything ran. `error.code` is one of the `cli_*` codes below. |
+| 4 | Output could not be written (`output_write_failed`); a closed reader is success. |
 
 The split is the useful one for a caller: exit 2 means the call was never made, so retrying it unchanged cannot help, while exit 1 means it was.
 
@@ -62,6 +70,8 @@ The split is the useful one for a caller: exit 2 means the call was never made, 
 
 Every structural failure emits one strict JSON `kind:"error"` event on stderr, leaves stdout empty, and exits 2. The `code` names the failure — `cli_unknown_argument` for an unknown spelling, `cli_unregistered_combination` for registered arguments in a mixture that is not, and one each for `cli_unknown_command`, `cli_missing_argument_value`, `cli_invalid_argument_value`, `cli_duplicate_argument`, `cli_unexpected_positional`, and `cli_invalid_utf8`. `message` identifies a safe argument spelling or the failure category and `hint` gives the command to run next; neither ever quotes a raw value, including secrets. These are decided before any config, secret source, filesystem, network, or domain I/O.
 
-Two exit-1 codes describe the tool itself rather than the call: `cli_invocation_invalid` means the program misread its own resolved invocation — an unknown action id, or an argument id the selected combination cannot produce — and `output_setup_failed` means an output sink (`--stdout-file`, `--stderr-file`, stream redirection) could not be established. Both are defects to report, not inputs to correct; retrying the same command cannot help.
+`cli_invocation_invalid` (exit 1) describes the tool itself rather than the call: the program misread its own resolved invocation — an unknown action id, or an argument id the selected combination cannot produce. It is a defect to report, not an input to correct; retrying the same command cannot help. `output_setup_failed` (exit 1) means an output sink (`--stdout-file`, `--stderr-file`, stream redirection) could not be established; the message names the flag and path, which is usually a missing directory or a permission to fix.
 
-Domain failures (exit 1) carry their own stable `error.code` instead, drawn from whatever this tool defines rather than from the `cli_*` set. No error message quotes a raw value it was given — an error event is routinely logged, and the input may hold secrets.
+A tool may also exit 2 with a code of its own for a usage error its argument grammar cannot express — two arguments that are each valid but cannot be combined, or a value whose meaning depends on the target. Such a call is likewise refused before anything is changed.
+
+Domain failures (exit 1) carry their own stable `error.code` instead, drawn from whatever this tool defines rather than from the `cli_*` set. Error events are routinely logged, so a message never quotes a value that came from an argument able to carry a credential — a header, a cookie, a token, a password, a proxy URL, an environment value, a form field. Such an error names the argument and the shape that was wrong, and stops there. A value that cannot be a secret — a path, a dot-path, a session name — is quoted, because an error that cannot say which one it means is not worth logging either.

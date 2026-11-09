@@ -7,10 +7,10 @@
 use std::net::SocketAddr;
 
 use axum::{
+    Router,
     body::Body,
     extract::Request,
-    http::{header, Response, StatusCode},
-    Router,
+    http::{Response, StatusCode, header},
 };
 use tokio::net::TcpListener;
 use tower::Service;

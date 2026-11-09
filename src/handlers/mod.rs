@@ -17,10 +17,10 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
-use axum::{routing::get, routing::post, Router};
+use axum::{Router, routing::get, routing::post};
 use serde_json::Value;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(feature = "nostr")]
 use crate::relay::RelayState;
@@ -155,12 +155,11 @@ async fn access_log(
         if let Some(error) = &log_meta.error {
             fields["error"] = error.clone();
         }
-        if let Some(handler_trace) = &log_meta.trace {
-            if let (Some(target), Some(source)) = (trace.as_object_mut(), handler_trace.as_object())
-            {
-                for (k, v) in source {
-                    target.insert(k.clone(), v.clone());
-                }
+        if let Some(handler_trace) = &log_meta.trace
+            && let (Some(target), Some(source)) = (trace.as_object_mut(), handler_trace.as_object())
+        {
+            for (k, v) in source {
+                target.insert(k.clone(), v.clone());
             }
         }
     }

@@ -82,6 +82,9 @@ pub trait Storage: Send + Sync + Clone {
     /// Get a spore by hash.
     async fn get_spore(&self, hash: &str) -> Result<Option<Vec<u8>>>;
 
+    /// Get the exact capsule published by a host, including its host signature.
+    async fn get_spore_on_host(&self, domain: &str, hash: &str) -> Result<Option<Vec<u8>>>;
+
     /// Save a mycelium to storage (successful sync).
     async fn save_mycelium(
         &self,
@@ -143,10 +146,27 @@ pub trait Storage: Send + Sync + Clone {
     async fn get_setting(&self, key: &str) -> Result<Option<String>>;
 
     /// Save a Nostr event to persistent storage (deduplicated by event_id).
+    #[allow(dead_code)]
     async fn save_nostr_event(&self, event_id: &str, event_json: &[u8]) -> Result<()>;
 
     /// Load all stored Nostr events.
     async fn get_nostr_events(&self) -> Result<Vec<Vec<u8>>>;
+
+    /// Load persistent keys with payloads so maintenance can delete malformed events.
+    async fn get_nostr_event_records(&self) -> Result<Vec<(String, Vec<u8>)>>;
+
+    /// Persist an event and its evictions in one transaction, or only delete events.
+    async fn mutate_nostr_events(
+        &self,
+        event: Option<(&str, &[u8])>,
+        removed_ids: &[String],
+    ) -> Result<()>;
+
+    /// Trim the persistent relay window before loading it at startup.
+    async fn trim_nostr_events(&self, max_events: usize) -> Result<()>;
+
+    /// Clear retry state while retaining the last verified manifest and hash.
+    async fn mark_mycelium_synced(&self, domain: &str) -> Result<()>;
 
     /// Save a taste report for a target URI.
     async fn save_taste(&self, target_uri: &str, domain: &str, data: &[u8]) -> Result<()>;
@@ -280,6 +300,15 @@ impl Storage for StorageBackend {
             StorageBackend::Postgres(s) => s.get_spore(hash).await,
             #[cfg(feature = "redb")]
             StorageBackend::Redb(s) => s.get_spore(hash).await,
+        }
+    }
+
+    async fn get_spore_on_host(&self, domain: &str, hash: &str) -> Result<Option<Vec<u8>>> {
+        match self {
+            #[cfg(feature = "postgres")]
+            StorageBackend::Postgres(s) => s.get_spore_on_host(domain, hash).await,
+            #[cfg(feature = "redb")]
+            StorageBackend::Redb(s) => s.get_spore_on_host(domain, hash).await,
         }
     }
 
@@ -443,6 +472,46 @@ impl Storage for StorageBackend {
             StorageBackend::Postgres(s) => s.get_nostr_events().await,
             #[cfg(feature = "redb")]
             StorageBackend::Redb(s) => s.get_nostr_events().await,
+        }
+    }
+
+    async fn get_nostr_event_records(&self) -> Result<Vec<(String, Vec<u8>)>> {
+        match self {
+            #[cfg(feature = "postgres")]
+            StorageBackend::Postgres(s) => s.get_nostr_event_records().await,
+            #[cfg(feature = "redb")]
+            StorageBackend::Redb(s) => s.get_nostr_event_records().await,
+        }
+    }
+
+    async fn mutate_nostr_events(
+        &self,
+        event: Option<(&str, &[u8])>,
+        removed_ids: &[String],
+    ) -> Result<()> {
+        match self {
+            #[cfg(feature = "postgres")]
+            Self::Postgres(storage) => storage.mutate_nostr_events(event, removed_ids).await,
+            #[cfg(feature = "redb")]
+            Self::Redb(storage) => storage.mutate_nostr_events(event, removed_ids).await,
+        }
+    }
+
+    async fn trim_nostr_events(&self, max_events: usize) -> Result<()> {
+        match self {
+            #[cfg(feature = "postgres")]
+            Self::Postgres(storage) => storage.trim_nostr_events(max_events).await,
+            #[cfg(feature = "redb")]
+            Self::Redb(storage) => storage.trim_nostr_events(max_events).await,
+        }
+    }
+
+    async fn mark_mycelium_synced(&self, domain: &str) -> Result<()> {
+        match self {
+            #[cfg(feature = "postgres")]
+            Self::Postgres(storage) => storage.mark_mycelium_synced(domain).await,
+            #[cfg(feature = "redb")]
+            Self::Redb(storage) => storage.mark_mycelium_synced(domain).await,
         }
     }
 

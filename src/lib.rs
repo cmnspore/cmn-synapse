@@ -19,4 +19,7 @@ pub use substrate::model;
 pub use storage::RedbStorage;
 pub use storage::{SporeBond, Storage};
 
-pub use handlers::{create_router, AppState};
+pub use handlers::{AppState, create_router};
+
+#[cfg(all(test, feature = "redb", feature = "nostr", feature = "ruvector"))]
+mod regression_tests;

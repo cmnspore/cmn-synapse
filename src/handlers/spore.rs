@@ -1,6 +1,6 @@
 use super::common::{build_taste_response, mirror_replicates, taste_limit};
 use super::response::{self, ApiResult};
-use super::{format_nodes, AppState};
+use super::{AppState, format_nodes};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use std::sync::Arc;
@@ -256,12 +256,16 @@ pub async fn get_spore_bonds(
                 query["relation"] = serde_json::json!(rel);
             }
 
-            response::success(serde_json::json!({
-                "query": query,
-                "bonds": bonds,
-                "total": total,
-                "max_depth_reached": lineage.max_depth_reached
-            }))
+            response::success_trace(
+                serde_json::json!({
+                    "query": query,
+                    "bonds": bonds,
+                    "total": total,
+                }),
+                serde_json::json!({
+                    "max_depth_reached": lineage.max_depth_reached
+                }),
+            )
         }
         Err(e) => {
             warn!(error = %e, hash = %hash, "Failed to get spore bonds");

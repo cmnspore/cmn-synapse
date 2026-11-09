@@ -1,5 +1,5 @@
-use super::response::{self, ApiResult};
 use super::AppState;
+use super::response::{self, ApiResult};
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -7,7 +7,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{info, info_span, warn, Instrument};
+use tracing::{Instrument, info, info_span, warn};
 
 /// Per-domain cooldown for cmn.json pulses to prevent abuse.
 /// Tracks the last accepted pulse timestamp (epoch ms) per domain.
@@ -141,23 +141,21 @@ async fn handle_cmn_pulse(state: &AppState, payload: &Value) -> ApiResult {
     };
 
     // Per-domain cooldown: reject if we processed a cmn.json pulse for this domain recently.
-    // Use write lock for both check and update to avoid TOCTOU race.
     let now_ms = crate::time::now_epoch_ms();
     {
-        let mut guard = CMN_PULSE_COOLDOWN.write().await;
-        if let Some(&last_ms) = guard.get(&domain) {
-            if now_ms.saturating_sub(last_ms) < CMN_PULSE_COOLDOWN_MS {
-                return response::error(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "rate_limited",
-                    &format!(
-                        "cmn.json pulse for {} was processed recently, retry after cooldown",
-                        domain
-                    ),
-                );
-            }
+        let guard = CMN_PULSE_COOLDOWN.read().await;
+        if let Some(&last_ms) = guard.get(&domain)
+            && now_ms.saturating_sub(last_ms) < CMN_PULSE_COOLDOWN_MS
+        {
+            return response::error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+                &format!(
+                    "cmn.json pulse for {} was processed recently, retry after cooldown",
+                    domain
+                ),
+            );
         }
-        guard.insert(domain.clone(), now_ms);
     }
 
     info!(domain = %domain, "cmn.json pulse received, refreshing");
@@ -167,6 +165,10 @@ async fn handle_cmn_pulse(state: &AppState, payload: &Value) -> ApiResult {
 
     match state.cmn_cache.get_entry(&domain).await {
         Ok(_entry) => {
+            CMN_PULSE_COOLDOWN
+                .write()
+                .await
+                .insert(domain.clone(), now_ms);
             info!(domain = %domain, "cmn.json refreshed from live server");
 
             // Trigger a crawl in background to pick up any mycelium changes

@@ -22,9 +22,11 @@
 
 #![cfg(feature = "nostr")]
 
+mod support;
+
 use ed25519_dalek::{Signer, SigningKey};
 use futures::{SinkExt, StreamExt};
-use nostr_sdk::JsonUtil;
+use nostr_sdk::prelude::{Client, Event, EventBuilder, Filter, FinalizeEvent, Keys, Kind};
 use serde_json::Value;
 use serial_test::serial;
 use std::sync::Arc;
@@ -42,6 +44,367 @@ fn now_epoch_ms() -> u64 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
+}
+
+async fn publish_ack(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    event: &Event,
+) -> Value {
+    let message = serde_json::json!([
+        "EVENT",
+        serde_json::from_str::<Value>(&event.as_json()).unwrap()
+    ]);
+    ws.send(tungstenite::Message::Text(message.to_string().into()))
+        .await
+        .unwrap();
+    let message = tokio::time::timeout(std::time::Duration::from_secs(3), ws.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let tungstenite::Message::Text(text) = message else {
+        panic!("expected NIP-01 acknowledgement")
+    };
+    let acknowledgement: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(acknowledgement[0], "OK");
+    assert_eq!(acknowledgement[1], event.id.to_hex());
+    acknowledgement
+}
+
+#[tokio::test]
+#[serial]
+async fn test_invalid_cmn_ack_has_no_history_broadcast_or_restart_leak() {
+    let (_, key) = generate_test_keypair();
+    if support::run_with_key_override(&format!("ed25519.{key}")) {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let config = create_nostr_config(directory.path(), vec![], false);
+    let storage = create_test_storage();
+    let bridge = Arc::new(
+        NostrBridge::from_config(&config, &storage, 1_048_576)
+            .await
+            .unwrap(),
+    );
+    let (key, _) = generate_test_keypair();
+    let mut payload = create_signed_spore(&key, "invalid.test", "b3.bad");
+    payload["capsule"]["core"]["synopsis"] = serde_json::json!("tampered after signing");
+    let event = bridge.build_event(&payload).unwrap();
+    let (address, relay, server) = start_relay_with_state(bridge.clone(), storage.clone()).await;
+    let mut broadcasts = relay.event_tx.subscribe();
+    let (mut publisher, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
+        .await
+        .unwrap();
+    let acknowledgement = publish_ack(&mut publisher, &event).await;
+    assert_eq!(acknowledgement[2], false);
+    assert!(acknowledgement[3].as_str().unwrap().starts_with("invalid:"));
+    for content in ["not JSON".to_string(), "x".repeat(1_048_577)] {
+        let invalid = EventBuilder::new(Kind::Custom(30078), content)
+            .tag(nostr_sdk::prelude::Tag::hashtag("cmn-spore"))
+            .finalize(&Keys::generate())
+            .unwrap();
+        assert_eq!(publish_ack(&mut publisher, &invalid).await[2], false);
+    }
+    assert!(bridge.events().read().await.is_empty());
+    assert!(storage.get_nostr_events().await.unwrap().is_empty());
+    assert!(storage.get_spore("b3.bad").await.unwrap().is_none());
+    assert!(matches!(
+        broadcasts.try_recv(),
+        Err(broadcast::error::TryRecvError::Empty)
+    ));
+    let restarted = NostrBridge::from_config(&config, &storage, 1_048_576)
+        .await
+        .unwrap();
+    assert!(restarted.events().read().await.is_empty());
+    publisher.close(None).await.unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+#[serial]
+async fn test_unavailable_domain_ack_rejects_storage_fallback_without_caching() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = create_nostr_config(directory.path(), vec![], false);
+    let storage = create_test_storage();
+    let (key, public) = generate_test_keypair();
+    let domain = "unreachable.invalid";
+    storage
+        .save_mycelium(
+            domain,
+            b"{\"capsule\":{\"core\":{\"updated_at_epoch_ms\":0}}}",
+            &format!("ed25519.{public}"),
+            "b3.cached",
+        )
+        .await
+        .unwrap();
+    let bridge = Arc::new(
+        NostrBridge::from_config(&config, &storage, 1_048_576)
+            .await
+            .unwrap(),
+    );
+    let event = bridge
+        .build_event(&create_signed_spore(&key, domain, "b3.retry"))
+        .unwrap();
+    let (address, _, server) = start_relay_with_state(bridge.clone(), storage.clone()).await;
+    let (mut publisher, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
+        .await
+        .unwrap();
+    let acknowledgement = publish_ack(&mut publisher, &event).await;
+    assert_eq!(acknowledgement[2], false);
+    assert!(acknowledgement[3].as_str().unwrap().contains("retry later"));
+    assert!(storage.get_nostr_events().await.unwrap().is_empty());
+    assert!(bridge.events().read().await.is_empty());
+    // An unavailable domain cannot establish invalidity using only its stale key.
+    let mut uncertain = create_signed_spore(&key, domain, "b3.rotated");
+    let other_key = SigningKey::from_bytes(&[99; 32]);
+    uncertain["capsule_signature"] = serde_json::json!(sign_jcs(&other_key, &uncertain["capsule"]));
+    let uncertain_event = bridge.build_event(&uncertain).unwrap();
+    let acknowledgement = publish_ack(&mut publisher, &uncertain_event).await;
+    assert_eq!(acknowledgement[2], false);
+    assert!(acknowledgement[3].as_str().unwrap().contains("retry later"));
+    assert!(storage.get_nostr_events().await.unwrap().is_empty());
+    publisher.close(None).await.unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+#[serial]
+async fn test_valid_duplicate_and_old_mycelium_ack_are_accepted() {
+    let (_, key) = generate_test_keypair();
+    if support::run_with_key_override(&format!("ed25519.{key}")) {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let config = create_nostr_config(directory.path(), vec![], false);
+    let storage = create_test_storage();
+    let bridge = Arc::new(
+        NostrBridge::from_config(&config, &storage, 1_048_576)
+            .await
+            .unwrap(),
+    );
+    let (key, _) = generate_test_keypair();
+    let payload = create_signed_spore(&key, "accepted.test", "b3.dup");
+    let event = bridge.build_event(&payload).unwrap();
+    let old = create_signed_mycelium(&key, "accepted.test", "unused");
+    let mut newer: substrate::Mycelium = serde_json::from_value(old.clone()).unwrap();
+    newer.capsule.core.updated_at_epoch_ms += 1;
+    newer.capsule.core_signature =
+        sign_jcs(&key, &serde_json::to_value(&newer.capsule.core).unwrap());
+    newer.capsule.uri = format!(
+        "cmn://accepted.test/mycelium/{}",
+        newer.computed_uri_hash().unwrap()
+    );
+    newer.capsule_signature = sign_jcs(&key, &serde_json::to_value(&newer.capsule).unwrap());
+    storage
+        .save_mycelium(
+            "accepted.test",
+            &serde_json::to_vec(&newer).unwrap(),
+            &newer.capsule.core.key,
+            &newer.computed_uri_hash().unwrap(),
+        )
+        .await
+        .unwrap();
+    let old_event = bridge.build_event(&old).unwrap();
+    let (address, _, server) = start_relay_with_state(bridge.clone(), storage.clone()).await;
+    let (mut publisher, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
+        .await
+        .unwrap();
+    assert_eq!(publish_ack(&mut publisher, &event).await[2], true);
+    assert_eq!(publish_ack(&mut publisher, &event).await[2], true);
+    assert_eq!(publish_ack(&mut publisher, &old_event).await[2], true);
+    assert_eq!(storage.get_nostr_events().await.unwrap().len(), 2);
+    let current: substrate::Mycelium = serde_json::from_slice(
+        &storage
+            .get_mycelium("accepted.test")
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        current.capsule.core.updated_at_epoch_ms,
+        newer.capsule.core.updated_at_epoch_ms
+    );
+    publisher.close(None).await.unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn test_default_history_limit_and_subscription_cap() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = create_nostr_config(directory.path(), vec![], false);
+    let storage = create_test_storage();
+    let bridge = Arc::new(
+        NostrBridge::from_config(&config, &storage, 1_048_576)
+            .await
+            .unwrap(),
+    );
+    let (key, _) = generate_test_keypair();
+    let pulses: Vec<_> = (0u32..300)
+        .map(|i| {
+            create_signed_spore(
+                &key,
+                "history.test",
+                &format!("b3.{}", bs58::encode(i.to_be_bytes()).into_string()),
+            )
+        })
+        .collect();
+    store_events(&bridge, &pulses).await;
+    let (address, server) = start_relay(bridge, storage).await;
+    let (mut subscriber, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
+        .await
+        .unwrap();
+    subscriber
+        .send(tungstenite::Message::Text(
+            serde_json::json!(["REQ", "history", {}]).to_string().into(),
+        ))
+        .await
+        .unwrap();
+    let (events, eose) = collect_until_eose(&mut subscriber, 5).await;
+    assert!(eose);
+    assert_eq!(events.len(), synapse::relay::DEFAULT_HISTORY_LIMIT);
+    for index in 1..synapse::relay::MAX_SUBSCRIPTIONS {
+        subscriber
+            .send(tungstenite::Message::Text(
+                serde_json::json!(["REQ",format!("sub{index}"),{"limit":0}])
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        assert!(collect_until_eose(&mut subscriber, 3).await.1);
+    }
+    subscriber
+        .send(tungstenite::Message::Text(
+            serde_json::json!(["REQ","overflow",{"limit":0}])
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let message = tokio::time::timeout(std::time::Duration::from_secs(3), subscriber.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let tungstenite::Message::Text(text) = message else {
+        panic!("expected CLOSED")
+    };
+    let closed: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(closed[0], "CLOSED");
+    assert_eq!(closed[1], "overflow");
+    subscriber.close(None).await.unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+#[serial]
+async fn test_lagged_connection_receives_close_and_other_client_can_write() {
+    let (_, key) = generate_test_keypair();
+    if support::run_with_key_override(&format!("ed25519.{key}")) {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let config = create_nostr_config(directory.path(), vec![], false);
+    let storage = create_test_storage();
+    let bridge = Arc::new(
+        NostrBridge::from_config(&config, &storage, 1_048_576)
+            .await
+            .unwrap(),
+    );
+    let (address, relay, server) = start_relay_with_state(bridge.clone(), storage.clone()).await;
+    let (mut subscriber, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
+        .await
+        .unwrap();
+    subscriber
+        .send(tungstenite::Message::Text(
+            serde_json::json!(["REQ", "live", {}]).to_string().into(),
+        ))
+        .await
+        .unwrap();
+    assert!(collect_until_eose(&mut subscriber, 3).await.1);
+    let (key, _) = generate_test_keypair();
+    let event = bridge
+        .build_event(&create_signed_spore(&key, "lag.test", "b3.ag"))
+        .unwrap();
+    // No await in this burst: the receiver necessarily loses messages from its 256-slot ring.
+    for _ in 0..300 {
+        relay.event_tx.send(event.clone()).unwrap();
+    }
+    let message = tokio::time::timeout(std::time::Duration::from_secs(3), subscriber.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let tungstenite::Message::Close(Some(close)) = message else {
+        panic!("expected visible close after lag")
+    };
+    assert_eq!(
+        close.code,
+        tungstenite::protocol::frame::coding::CloseCode::Again
+    );
+    let (mut publisher, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
+        .await
+        .unwrap();
+    assert_eq!(publish_ack(&mut publisher, &event).await[2], true);
+    assert_eq!(storage.get_nostr_events().await.unwrap().len(), 1);
+    publisher.close(None).await.unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+#[serial]
+async fn test_stopped_history_reader_does_not_hold_cache_or_block_writes() {
+    let (_, key) = generate_test_keypair();
+    if support::run_with_key_override(&format!("ed25519.{key}")) {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let config = create_nostr_config(directory.path(), vec![], false);
+    let storage = create_test_storage();
+    let bridge = Arc::new(
+        NostrBridge::from_config(&config, &storage, 1_048_576)
+            .await
+            .unwrap(),
+    );
+    let history = EventBuilder::new(Kind::Custom(30078), "x".repeat(128 * 1024))
+        .finalize(&Keys::generate())
+        .unwrap();
+    bridge
+        .events()
+        .write()
+        .await
+        .extend(std::iter::repeat_n(history, 300));
+    let (address, _, server) = start_relay_with_state(bridge.clone(), storage.clone()).await;
+    let (mut stopped_reader, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
+        .await
+        .unwrap();
+    stopped_reader
+        .send(tungstenite::Message::Text(
+            serde_json::json!(["REQ", "slow", {}]).to_string().into(),
+        ))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let events = bridge.events();
+    let guard = tokio::time::timeout(std::time::Duration::from_millis(200), events.write())
+        .await
+        .unwrap();
+    drop(guard);
+    let (key, _) = generate_test_keypair();
+    let event = bridge
+        .build_event(&create_signed_spore(&key, "fast.test", "b3.fast"))
+        .unwrap();
+    let (mut publisher, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
+        .await
+        .unwrap();
+    assert_eq!(publish_ack(&mut publisher, &event).await[2], true);
+    assert_eq!(storage.get_nostr_events().await.unwrap().len(), 1);
+    publisher.close(None).await.unwrap();
+    drop(stopped_reader);
+    server.abort();
 }
 
 // --- Test helpers ---
@@ -207,16 +570,21 @@ fn test_config() -> Arc<synapse::config::AppConfig> {
 
 fn create_test_app_state(storage: StorageBackend) -> Arc<synapse::AppState> {
     let config = test_config();
+    let http = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_millis(100))
+        .build()
+        .unwrap();
     let cmn_cache = Arc::new(synapse::cmn_cache::CmnCache::new(
         300,
         256 * 1024,
-        reqwest::Client::new(),
+        http.clone(),
     ));
     let cache_config = synapse::config::CacheConfig::default();
     let crawler = synapse::crawler::Crawler::new(
         storage.clone(),
         cmn_cache.clone(),
-        reqwest::Client::new(),
+        http,
         &cache_config,
         &config.pulse,
         #[cfg(feature = "ruvector")]
@@ -240,10 +608,7 @@ fn create_test_app_state(storage: StorageBackend) -> Arc<synapse::AppState> {
     })
 }
 
-async fn process_event_into_storage(
-    event: &nostr_sdk::Event,
-    storage: &StorageBackend,
-) -> anyhow::Result<()> {
+async fn process_event_into_storage(event: &Event, storage: &StorageBackend) -> anyhow::Result<()> {
     let state = create_test_app_state(storage.clone());
     synapse::nostr::process_cmn_event_from_relay(
         event,
@@ -274,13 +639,13 @@ fn create_nostr_config(
 /// Start a relay server with the given bridge and storage, return (addr, relay_state, handle).
 async fn start_relay_with_state(
     bridge: Arc<NostrBridge>,
-    _storage: StorageBackend,
+    storage: StorageBackend,
 ) -> (
     std::net::SocketAddr,
     Arc<RelayState>,
     tokio::task::JoinHandle<Result<(), std::io::Error>>,
 ) {
-    let (event_tx, _) = broadcast::channel::<nostr_sdk::Event>(256);
+    let (event_tx, _) = broadcast::channel::<Event>(256);
     let relay_state = Arc::new(RelayState {
         event_tx,
         bridge,
@@ -288,6 +653,12 @@ async fn start_relay_with_state(
         app_state: std::sync::OnceLock::new(),
     });
 
+    assert!(
+        relay_state
+            .app_state
+            .set(create_test_app_state(storage))
+            .is_ok()
+    );
     let state = relay_state.clone();
     let app = axum::Router::new().route(
         "/",
@@ -373,7 +744,7 @@ async fn test_build_event_spore_tags() {
     let event = bridge.build_event(&pulse).unwrap();
 
     // kind must be 30078
-    assert_eq!(event.kind, nostr_sdk::Kind::Custom(30078));
+    assert_eq!(event.kind, Kind::Custom(30078));
 
     // Must have #t = cmn-spore
     let tags: Vec<Vec<String>> = event.tags.iter().map(|t| t.clone().to_vec()).collect();
@@ -406,7 +777,7 @@ async fn test_build_event_mycelium_tags() {
     let pulse = create_signed_mycelium(&signing_key, "example.com", "b3.myc");
     let event = bridge.build_event(&pulse).unwrap();
 
-    assert_eq!(event.kind, nostr_sdk::Kind::Custom(30078));
+    assert_eq!(event.kind, Kind::Custom(30078));
 
     let tags: Vec<Vec<String>> = event.tags.iter().map(|t| t.clone().to_vec()).collect();
     let has_mycelium_tag = tags
@@ -513,7 +884,12 @@ async fn test_relay_delivers_stored_events() {
 // =============================================================================
 
 #[tokio::test]
+#[serial]
 async fn test_relay_accepts_event_submission() {
+    let (_, key) = generate_test_keypair();
+    if support::run_with_key_override(&format!("ed25519.{key}")) {
+        return;
+    }
     let key_dir = tempfile::tempdir().unwrap();
     let config = create_nostr_config(key_dir.path(), vec![], false);
     let storage = create_test_storage();
@@ -579,7 +955,12 @@ async fn test_relay_accepts_event_submission() {
 // =============================================================================
 
 #[tokio::test]
+#[serial]
 async fn test_relay_close_stops_delivery() {
+    let (_, key) = generate_test_keypair();
+    if support::run_with_key_override(&format!("ed25519.{key}")) {
+        return;
+    }
     let key_dir = tempfile::tempdir().unwrap();
     let config = create_nostr_config(key_dir.path(), vec![], false);
     let storage = create_test_storage();
@@ -628,10 +1009,10 @@ async fn test_relay_close_stops_delivery() {
         match tokio::time::timeout_at(deadline, ws.next()).await {
             Ok(Some(Ok(tungstenite::Message::Text(text)))) => {
                 let msg: Value = serde_json::from_str(&text).unwrap();
-                if let Some(arr) = msg.as_array() {
-                    if arr[0].as_str() == Some("EVENT") {
-                        got_event = true;
-                    }
+                if let Some(arr) = msg.as_array()
+                    && arr[0].as_str() == Some("EVENT")
+                {
+                    got_event = true;
                 }
             }
             _ => break,
@@ -667,9 +1048,9 @@ async fn test_relay_rejects_wrong_kind() {
     let url = format!("ws://127.0.0.1:{}", addr.port());
 
     // Build a non-CMN event (kind 1 = text note)
-    let nostr_keys = nostr_sdk::Keys::generate();
-    let wrong_event = nostr_sdk::EventBuilder::new(nostr_sdk::Kind::TextNote, "hello world")
-        .sign_with_keys(&nostr_keys)
+    let nostr_keys = Keys::generate();
+    let wrong_event = EventBuilder::new(Kind::TextNote, "hello world")
+        .finalize(&nostr_keys)
         .unwrap();
 
     let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
@@ -708,9 +1089,9 @@ async fn test_relay_rejects_missing_cmn_tag() {
     let url = format!("ws://127.0.0.1:{}", addr.port());
 
     // Build kind 30078 event but without cmn-spore/cmn-mycelium tag
-    let nostr_keys = nostr_sdk::Keys::generate();
-    let bad_event = nostr_sdk::EventBuilder::new(nostr_sdk::Kind::Custom(30078), "no cmn tag here")
-        .sign_with_keys(&nostr_keys)
+    let nostr_keys = Keys::generate();
+    let bad_event = EventBuilder::new(Kind::Custom(30078), "no cmn tag here")
+        .finalize(&nostr_keys)
         .unwrap();
 
     let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
@@ -786,11 +1167,8 @@ async fn test_relay_sync_mycelium() {
     let domain = "myc-sync.local";
     let hash = "b3.myc1";
 
-    unsafe {
-        std::env::set_var(
-            "CMN_PUBLIC_KEY_OVERRIDE",
-            format!("ed25519.{}", public_key_b58),
-        )
+    if support::run_with_key_override(&format!("ed25519.{public_key_b58}")) {
+        return;
     };
 
     let key_dir = tempfile::tempdir().unwrap();
@@ -811,14 +1189,15 @@ async fn test_relay_sync_mycelium() {
     // Synapse B connects and fetches
     let storage_b = create_test_storage();
     let relay_url = format!("ws://127.0.0.1:{}", addr.port());
-    let client = nostr_sdk::Client::default();
+    let client = Client::default();
     client.add_relay(&relay_url).await.unwrap();
     client.connect().await;
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-    let filter = nostr_sdk::Filter::new().kind(nostr_sdk::Kind::Custom(30078));
+    let filter = Filter::new().kind(Kind::Custom(30078));
     let events = client
-        .fetch_events(filter, tokio::time::Duration::from_secs(5))
+        .fetch_events(filter)
+        .timeout(tokio::time::Duration::from_secs(5))
         .await
         .unwrap();
 
@@ -835,7 +1214,6 @@ async fn test_relay_sync_mycelium() {
 
     // Verify mycelium was stored in B
     let myc = storage_b.get_mycelium(domain).await.unwrap();
-    unsafe { std::env::remove_var("CMN_PUBLIC_KEY_OVERRIDE") };
     assert!(myc.is_some(), "Mycelium not synced to B");
 }
 
@@ -929,11 +1307,8 @@ async fn test_two_synapse_relay_sync() {
     let hash1 = "b3.aaa111";
     let hash2 = "b3.bbb222";
 
-    unsafe {
-        std::env::set_var(
-            "CMN_PUBLIC_KEY_OVERRIDE",
-            format!("ed25519.{}", public_key_b58),
-        )
+    if support::run_with_key_override(&format!("ed25519.{public_key_b58}")) {
+        return;
     };
 
     // --- Synapse A: build events, start relay ---
@@ -963,14 +1338,15 @@ async fn test_two_synapse_relay_sync() {
     let storage_b = create_test_storage();
 
     let relay_url = format!("ws://127.0.0.1:{}", addr.port());
-    let client = nostr_sdk::Client::default();
+    let client = Client::default();
     client.add_relay(&relay_url).await.unwrap();
     client.connect().await;
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-    let filter = nostr_sdk::Filter::new().kind(nostr_sdk::Kind::Custom(30078));
+    let filter = Filter::new().kind(Kind::Custom(30078));
     let events = client
-        .fetch_events(filter, tokio::time::Duration::from_secs(5))
+        .fetch_events(filter)
+        .timeout(tokio::time::Duration::from_secs(5))
         .await
         .unwrap();
 
@@ -989,8 +1365,6 @@ async fn test_two_synapse_relay_sync() {
     let s1 = storage_b.get_spore(hash1).await.unwrap();
     let s2 = storage_b.get_spore(hash2).await.unwrap();
 
-    unsafe { std::env::remove_var("CMN_PUBLIC_KEY_OVERRIDE") };
-
     assert!(s1.is_some(), "Spore {} not synced to B", hash1);
     assert!(s2.is_some(), "Spore {} not synced to B", hash2);
 }
@@ -1006,11 +1380,8 @@ async fn test_process_cmn_event_spore_roundtrip() {
     let domain = "proc-spore.local";
     let hash = "b3.procsp1";
 
-    unsafe {
-        std::env::set_var(
-            "CMN_PUBLIC_KEY_OVERRIDE",
-            format!("ed25519.{}", public_key_b58),
-        )
+    if support::run_with_key_override(&format!("ed25519.{public_key_b58}")) {
+        return;
     };
 
     let key_dir = tempfile::tempdir().unwrap();
@@ -1029,8 +1400,6 @@ async fn test_process_cmn_event_spore_roundtrip() {
     process_event_into_storage(&event, &target_storage)
         .await
         .unwrap();
-
-    unsafe { std::env::remove_var("CMN_PUBLIC_KEY_OVERRIDE") };
 
     // Verify spore was stored
     let stored = target_storage.get_spore(hash).await.unwrap();
@@ -1059,11 +1428,8 @@ async fn test_process_cmn_event_mycelium_roundtrip() {
     let domain = "proc-myc.local";
     let hash = "b3.procmyc1";
 
-    unsafe {
-        std::env::set_var(
-            "CMN_PUBLIC_KEY_OVERRIDE",
-            format!("ed25519.{}", public_key_b58),
-        )
+    if support::run_with_key_override(&format!("ed25519.{public_key_b58}")) {
+        return;
     };
 
     let key_dir = tempfile::tempdir().unwrap();
@@ -1081,8 +1447,6 @@ async fn test_process_cmn_event_mycelium_roundtrip() {
         .await
         .unwrap();
 
-    unsafe { std::env::remove_var("CMN_PUBLIC_KEY_OVERRIDE") };
-
     // Verify mycelium was stored
     let stored = target_storage.get_mycelium(domain).await.unwrap();
     assert!(
@@ -1091,10 +1455,12 @@ async fn test_process_cmn_event_mycelium_roundtrip() {
     );
 
     let stored_data: Value = serde_json::from_slice(&stored.unwrap()).unwrap();
-    assert!(stored_data["capsule"]["uri"]
-        .as_str()
-        .unwrap_or_default()
-        .starts_with(&format!("cmn://{}/mycelium/", domain)));
+    assert!(
+        stored_data["capsule"]["uri"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with(&format!("cmn://{}/mycelium/", domain))
+    );
     assert_eq!(
         stored_data["$schema"],
         "https://cmn.dev/schemas/v1/mycelium.json"
@@ -1114,11 +1480,8 @@ async fn test_spore_bonds_preserved_through_nostr() {
     let parent_hash = "b3.parent1";
     let dep_hash = "b3.dep1";
 
-    unsafe {
-        std::env::set_var(
-            "CMN_PUBLIC_KEY_OVERRIDE",
-            format!("ed25519.{}", public_key_b58),
-        )
+    if support::run_with_key_override(&format!("ed25519.{public_key_b58}")) {
+        return;
     };
 
     let bonds = vec![
@@ -1147,8 +1510,6 @@ async fn test_spore_bonds_preserved_through_nostr() {
     process_event_into_storage(&event, &target_storage)
         .await
         .unwrap();
-
-    unsafe { std::env::remove_var("CMN_PUBLIC_KEY_OVERRIDE") };
 
     // Verify spore stored
     let stored = target_storage.get_spore(hash).await.unwrap();
@@ -1187,7 +1548,12 @@ async fn test_spore_bonds_preserved_through_nostr() {
 // =============================================================================
 
 #[tokio::test]
+#[serial]
 async fn test_relay_live_broadcast_to_subscriber() {
+    let (_, key) = generate_test_keypair();
+    if support::run_with_key_override(&format!("ed25519.{key}")) {
+        return;
+    }
     let key_dir = tempfile::tempdir().unwrap();
     let config = create_nostr_config(key_dir.path(), vec![], false);
     let storage = create_test_storage();
@@ -1234,12 +1600,13 @@ async fn test_relay_live_broadcast_to_subscriber() {
         match tokio::time::timeout_at(deadline, ws_sub.next()).await {
             Ok(Some(Ok(tungstenite::Message::Text(text)))) => {
                 let msg: Value = serde_json::from_str(&text).unwrap();
-                if let Some(arr) = msg.as_array() {
-                    if arr[0].as_str() == Some("EVENT") && arr[1].as_str() == Some("live-sub") {
-                        received_live = true;
-                        received_event_id = arr[2]["id"].as_str().unwrap_or("").to_string();
-                        break;
-                    }
+                if let Some(arr) = msg.as_array()
+                    && arr[0].as_str() == Some("EVENT")
+                    && arr[1].as_str() == Some("live-sub")
+                {
+                    received_live = true;
+                    received_event_id = arr[2]["id"].as_str().unwrap_or("").to_string();
+                    break;
                 }
             }
             _ => break,
@@ -1267,7 +1634,12 @@ async fn test_relay_live_broadcast_to_subscriber() {
 // =============================================================================
 
 #[tokio::test]
+#[serial]
 async fn test_nostr_event_dedup_in_relay() {
+    let (_, key) = generate_test_keypair();
+    if support::run_with_key_override(&format!("ed25519.{key}")) {
+        return;
+    }
     let key_dir = tempfile::tempdir().unwrap();
     let config = create_nostr_config(key_dir.path(), vec![], false);
     let storage = create_test_storage();
@@ -1341,11 +1713,8 @@ async fn test_data_integrity_nostr_vs_original() {
     let domain = "integrity.local";
     let hash = "b3.integ1";
 
-    unsafe {
-        std::env::set_var(
-            "CMN_PUBLIC_KEY_OVERRIDE",
-            format!("ed25519.{}", public_key_b58),
-        )
+    if support::run_with_key_override(&format!("ed25519.{public_key_b58}")) {
+        return;
     };
 
     let key_dir = tempfile::tempdir().unwrap();
@@ -1371,8 +1740,6 @@ async fn test_data_integrity_nostr_vs_original() {
     process_event_into_storage(&event, &nostr_storage)
         .await
         .unwrap();
-
-    unsafe { std::env::remove_var("CMN_PUBLIC_KEY_OVERRIDE") };
 
     // Compare stored data
     let direct_data = direct_storage.get_spore(hash).await.unwrap().unwrap();
@@ -1413,11 +1780,8 @@ async fn test_full_relay_chain_forward_fetch_process() {
     let hash_spore = "b3.chainsp1";
     let hash_mycelium = "b3.chainmyc1";
 
-    unsafe {
-        std::env::set_var(
-            "CMN_PUBLIC_KEY_OVERRIDE",
-            format!("ed25519.{}", public_key_b58),
-        )
+    if support::run_with_key_override(&format!("ed25519.{public_key_b58}")) {
+        return;
     };
 
     // --- Node A: build events from both spore and mycelium pulses, start relay ---
@@ -1446,14 +1810,15 @@ async fn test_full_relay_chain_forward_fetch_process() {
     // --- Node B: connect to A's relay, fetch all events, process into storage ---
     let storage_b = create_test_storage();
     let relay_url = format!("ws://127.0.0.1:{}", addr.port());
-    let client = nostr_sdk::Client::default();
+    let client = Client::default();
     client.add_relay(&relay_url).await.unwrap();
     client.connect().await;
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-    let filter = nostr_sdk::Filter::new().kind(nostr_sdk::Kind::Custom(30078));
+    let filter = Filter::new().kind(Kind::Custom(30078));
     let events = client
-        .fetch_events(filter, tokio::time::Duration::from_secs(5))
+        .fetch_events(filter)
+        .timeout(tokio::time::Duration::from_secs(5))
         .await
         .unwrap();
 
@@ -1487,10 +1852,12 @@ async fn test_full_relay_chain_forward_fetch_process() {
     );
 
     let myc_data: Value = serde_json::from_slice(&myc.unwrap()).unwrap();
-    assert!(myc_data["capsule"]["uri"]
-        .as_str()
-        .unwrap_or_default()
-        .starts_with(&format!("cmn://{}/mycelium/", domain)));
+    assert!(
+        myc_data["capsule"]["uri"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with(&format!("cmn://{}/mycelium/", domain))
+    );
 
     // Verify domain spores includes our hash
     let domain_spores = storage_b.get_domain_spores(domain).await.unwrap();
@@ -1498,6 +1865,4 @@ async fn test_full_relay_chain_forward_fetch_process() {
         domain_spores.contains(&hash_spore.to_string()),
         "Spore hash not in domain spores list"
     );
-
-    unsafe { std::env::remove_var("CMN_PUBLIC_KEY_OVERRIDE") };
 }

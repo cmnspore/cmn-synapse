@@ -1,7 +1,7 @@
 [package]
 name = "cmn-synapse"
-version = "0.3.0"
-edition = "2021"
+version = "0.3.1"
+edition = "2024"
 description = "The reference CMN indexer — ingests signed manifests, indexes spores and myceliums, serves discovery queries, and syncs across instances via Nostr."
 license = "MIT"
 repository = "https://github.com/cmnspore/cmn-synapse"
@@ -26,13 +26,13 @@ ruvector = ["dep:ruvector-core"]
 
 [dependencies]
 # shared library
-cmn-substrate = { version = "0.4", features = ["client-safe-dns"] }
+cmn-substrate = { version = "0.5", features = ["client-safe-dns"] }
 
 # Agent-First Data tracing
-agent-first-data = "0.31.0"
+agent-first-data = "0.37.0"
 
 # async runtime
-tokio = { version = "1.53", features = ["full"] }
+tokio = { version = "1.54", features = ["full"] }
 
 # http server
 axum = { version = "0.8", features = ["macros", "ws"] }
@@ -41,11 +41,11 @@ hyper-util = { version = "0.1", features = ["tokio", "server-auto", "service"] }
 
 # database
 sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "chrono"], optional = true }
-redb = { version = "4.1", optional = true }
+redb = { version = "4.5", optional = true }
 
 # serialization
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["preserve_order"] }
 serde_jcs = "0.2"
 
 # config
@@ -69,16 +69,19 @@ rustls-pki-types = { version = "1.15", features = ["std"] }
 
 # acme (let's encrypt)
 tokio-rustls-acme = { version = "0.9", features = ["axum"] }
+# Keep in step with tokio-rustls-acme: 0.9.1 requires axum-server ^0.8, and two
+# axum-server versions make its AxumAcceptor fail the Accept bound. Raise both
+# together once tokio-rustls-acme supports axum-server 0.9.
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 futures = "0.3"
 rcgen = "0.14"
 x509-parser = "0.18"
 
 # nostr
-nostr-sdk = { version = "0.44", optional = true }
+nostr-sdk = { version = "0.45", optional = true }
 
 # search
-ruvector-core = { version = "2.3", default-features = false, features = ["storage"], optional = true }
+ruvector-core = { version = "2.5", default-features = false, features = ["storage"], optional = true }
 
 # encoding
 base64 = "0.23"

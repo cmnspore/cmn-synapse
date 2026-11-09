@@ -317,6 +317,15 @@ fn get_lineage(hash, max_depth):
 ```
 
 **Retry strategy (exponential backoff):**
+
+Only network errors, timeouts, and 5xx responses schedule retry. Permanent
+content failures (including 404, invalid signatures, and hash mismatches) are
+logged and skipped. Storage failures propagate without clearing retry state.
+The last verified manifest remains readable while missing spores are retried;
+post-pulse crawling uses this same state. Completion clears the retry counter,
+last error, and scheduled time. An unchanged hash or an older remote manifest
+still checks the saved inventory for missing content.
+
 - retry_count=1: 1 minute
 - retry_count=2: 5 minutes
 - retry_count=3: 15 minutes
@@ -347,8 +356,12 @@ Where:
 
 When the `nostr` feature is enabled, Synapse stores Nostr events in-memory for relay serving:
 
-- Events are stored in a shared `Arc<RwLock<Vec<Event>>>` inside `NostrBridge`
+- Events are stored in a shared `Arc<RwLock<VecDeque<Event>>>` inside `NostrBridge`
 - Deduplication by event ID prevents storing the same event twice
+- `nostr.max_events` bounds memory and the persistent `nostr_events` table
+- Event insertion and disk eviction use one transaction before memory changes
+- Startup trims persistent history before reading it; storage errors fail startup
+- PostgreSQL trims by insertion time/event ID; redb trims by event ID
 - Events arrive from three sources:
   1. HTTP pulse forwarding (`forward_pulse`)
   2. External relay subscription (`subscribe`)
@@ -370,12 +383,19 @@ The key is auto-generated on first run if it does not exist.
 All CMN content from Nostr events undergoes the same verification as HTTP pulses:
 
 ```
-1. Parse event content as CMN pulse JSON
-2. Validate protocol = "cmn/1"
-3. Extract domain from URI
-4. Fetch cmn.json, verify Ed25519 signature
-5. Store spore/mycelium in database
+1. Check Nostr envelope signature, kind, tags, and content size
+2. Parse duplicate-safe JSON and validate the CMN schema
+3. Extract domains and confirm their keys using fresh cmn.json data
+4. Verify CMN signatures, content hashes, and timestamps
+5. Ingest CMN content; valid duplicates/older myceliums remain relay-eligible
+6. Persist bounded relay history, then broadcast and acknowledge the event
 ```
+
+Unavailable identity verification rejects without caching and returns a retry
+reason. Known-invalid content rejects with `invalid:`. Direct EVENT submissions
+receive NIP-01 `OK` responses. The explicit `--prune-nostr` maintenance action
+removes legacy events without exact matching content in CMN tables; it never
+runs automatically at startup.
 
 ## 9. Background Tasks
 

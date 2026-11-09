@@ -1,6 +1,6 @@
+use axum::Json;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::Json;
 use serde_json::Value;
 use std::sync::OnceLock;
 
@@ -58,10 +58,10 @@ fn redact_embedded_cmn_urls(value: &mut Value) {
     match value {
         Value::Object(fields) => {
             for (name, field) in fields {
-                if name == "url" {
-                    if let Value::String(raw_url) = field {
-                        *raw_url = agent_first_data::redact_url_secrets(raw_url);
-                    }
+                if name == "url"
+                    && let Value::String(raw_url) = field
+                {
+                    *raw_url = agent_first_data::redact_url_secrets(raw_url);
                 }
                 redact_embedded_cmn_urls(field);
             }

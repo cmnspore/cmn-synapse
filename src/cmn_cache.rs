@@ -2,7 +2,7 @@
 //!
 //! Provides TTL-based caching with stale fallback and storage-backed key fallback.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -13,6 +13,26 @@ use crate::storage::{Storage, StorageBackend};
 use substrate::CmnEntry;
 
 const DOMAIN_STATE_JUMP_THRESHOLD: u64 = 1000;
+
+/// A fetched identity was present but failed verification; retrying transport cannot fix it.
+#[derive(Debug)]
+pub(crate) struct DomainVerificationFailure(pub anyhow::Error);
+
+impl std::fmt::Display for DomainVerificationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::error::Error for DomainVerificationFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
+fn verification_failure(error: anyhow::Error) -> anyhow::Error {
+    DomainVerificationFailure(error).into()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeySource {
@@ -221,15 +241,12 @@ mod tests {
         )
         .unwrap();
         let equivocation_pin = domain_state_pin_from_entry("example.com", &equivocation).unwrap();
-        assert!(validate_domain_state_transition(
-            "example.com",
-            &pin,
-            &equivocation_pin,
-            &equivocation
-        )
-        .unwrap_err()
-        .to_string()
-        .contains("domain_state_equivocation"));
+        assert!(
+            validate_domain_state_transition("example.com", &pin, &equivocation_pin, &equivocation)
+                .unwrap_err()
+                .to_string()
+                .contains("domain_state_equivocation")
+        );
     }
 
     #[test]
@@ -241,15 +258,12 @@ mod tests {
 
         let unproven = cmn_entry("example.com", 2, &new_key, &new_private);
         let unproven_pin = domain_state_pin_from_entry("example.com", &unproven).unwrap();
-        assert!(validate_domain_state_transition(
-            "example.com",
-            &old_pin,
-            &unproven_pin,
-            &unproven
-        )
-        .unwrap_err()
-        .to_string()
-        .contains("domain_key_rotation_unproven"));
+        assert!(
+            validate_domain_state_transition("example.com", &old_pin, &unproven_pin, &unproven)
+                .unwrap_err()
+                .to_string()
+                .contains("domain_key_rotation_unproven")
+        );
 
         let mut proven = cmn_entry("example.com", 2, &new_key, &new_private);
         proven.capsules[0].history = vec![rotation_entry(
@@ -334,6 +348,13 @@ impl CmnCache {
                     .clone();
                 Ok(ResolvedKey { key, source, hint })
             }
+            Err(fetch_err)
+                if fetch_err
+                    .downcast_ref::<DomainVerificationFailure>()
+                    .is_some() =>
+            {
+                Err(fetch_err)
+            }
             Err(fetch_err) => match storage.get_domain_public_key(domain).await {
                 Ok(Some(key)) => Ok(ResolvedKey {
                     key,
@@ -341,11 +362,8 @@ impl CmnCache {
                     hint: Some(fetch_err.to_string()),
                 }),
                 Ok(None) => Err(fetch_err),
-                Err(storage_err) => Err(anyhow!(
-                    "Failed to resolve key for {}: {}; storage fallback failed: {}",
-                    domain,
-                    fetch_err,
-                    storage_err
+                Err(storage_err) => Err(storage_err.context(
+                    "Failed to read the stored domain key after an identity fetch failure",
                 )),
             },
         }
@@ -374,13 +392,20 @@ impl CmnCache {
                         hint,
                     })
                 } else {
-                    Err(anyhow!(
+                    Err(verification_failure(anyhow!(
                         "Key {} is not confirmed by {} at timestamp {}",
                         key,
                         domain,
                         signed_at_epoch_ms
-                    ))
+                    )))
                 }
+            }
+            Err(fetch_err)
+                if fetch_err
+                    .downcast_ref::<DomainVerificationFailure>()
+                    .is_some() =>
+            {
+                Err(fetch_err)
             }
             Err(fetch_err) => match storage.get_domain_public_key(domain).await {
                 Ok(Some(stored_key)) if stored_key == key => Ok(ResolvedKey {
@@ -389,11 +414,8 @@ impl CmnCache {
                     hint: Some(fetch_err.to_string()),
                 }),
                 Ok(Some(_)) | Ok(None) => Err(fetch_err),
-                Err(storage_err) => Err(anyhow!(
-                    "Failed to resolve key for {}: {}; storage fallback failed: {}",
-                    domain,
-                    fetch_err,
-                    storage_err
+                Err(storage_err) => Err(storage_err.context(
+                    "Failed to read the stored domain key after an identity fetch failure",
                 )),
             },
         }
@@ -419,7 +441,7 @@ impl CmnCache {
         let fetched_entry = match self.fetch_entry(domain).await {
             Ok(entry) => match self.validate_and_pin_entry(domain, &entry).await {
                 Ok(()) => Ok(entry),
-                Err(e) => Err(e),
+                Err(e) => Err(verification_failure(e)),
             },
             Err(e) => Err(e),
         };
@@ -437,6 +459,9 @@ impl CmnCache {
                 Ok((entry, KeySource::Network, None))
             }
             Err(e) => {
+                if e.downcast_ref::<DomainVerificationFailure>().is_some() {
+                    return Err(e);
+                }
                 if let Some(cached) = stale_entry {
                     warn!(domain = %domain, error = %e, "Using stale cmn.json cache entry");
                     Ok((cached.entry, KeySource::MemoryStale, Some(e.to_string())))
@@ -448,9 +473,33 @@ impl CmnCache {
     }
 
     async fn fetch_entry(&self, domain: &str) -> Result<CmnEntry> {
-        let opts = substrate::client::FetchOptions::with_max_bytes(self.max_cmn_bytes);
-        let entry = substrate::client::fetch_cmn_entry(&self.http, domain, opts).await?;
-        verify_cmn_entry(domain, &entry)?;
+        let payload = crate::crawler::fetch_json(
+            &self.http,
+            &substrate::cmn_entry_url(domain),
+            self.max_cmn_bytes,
+        )
+        .await
+        .map_err(|error| {
+            let transport_failure = crate::crawler::is_retryable_crawl_error(&error)
+                || error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<reqwest::Error>()
+                        .is_some_and(|error| error.status().is_some())
+                });
+            if transport_failure {
+                error
+            } else {
+                verification_failure(error)
+            }
+        })?;
+        if substrate::validate_schema(&payload).map_err(verification_failure)?
+            != substrate::SchemaType::Cmn
+        {
+            return Err(verification_failure(anyhow!("Expected cmn.json")));
+        }
+        let entry: CmnEntry =
+            serde_json::from_value(payload).map_err(|error| verification_failure(error.into()))?;
+        verify_cmn_entry(domain, &entry).map_err(verification_failure)?;
         Ok(entry)
     }
 

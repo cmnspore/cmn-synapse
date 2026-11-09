@@ -12,6 +12,90 @@ use tower::ServiceExt;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+#[tokio::test]
+async fn rebuild_cli_reports_partial_failure_for_503_and_invalid_embeddings() {
+    use synapse::storage::Storage;
+    use wiremock::matchers::body_string_contains;
+
+    for failed_response in [
+        ResponseTemplate::new(503),
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({"embeddings":[["invalid"]]})),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .and(body_string_contains("Good"))
+            .respond_with(OllamaEmbedResponder { dimensions: DIMS })
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .and(body_string_contains("Bad"))
+            .respond_with(failed_response)
+            .mount(&server)
+            .await;
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("data.redb");
+        let storage = synapse::storage::RedbStorage::open(&database).unwrap();
+        storage
+            .save_mycelium("rebuild.test", b"{}", "key", "hash")
+            .await
+            .unwrap();
+        for (hash, name) in [("b3.good", "Good"), ("b3.bad", "Bad")] {
+            let payload = make_spore_json(name, "CLI rebuild fixture", "rebuild.test", "MIT");
+            storage
+                .save_spore(
+                    hash,
+                    "rebuild.test",
+                    &serde_json::to_vec(&payload).unwrap(),
+                    &[],
+                )
+                .await
+                .unwrap();
+        }
+        drop(storage);
+        let config = serde_json::json!({
+            "debug":false,"log_format":"json",
+            "storage":{"backend":"redb","redb_path":database},
+            "http":{"enabled":true,"address":"127.0.0.1:0"},
+            "search":{"enabled":true,"index_path":directory.path().join("index"),
+                "embedding":{"provider":"ollama","url":server.uri(),"model":"fixture","dimensions":DIMS}}
+        });
+        let config_path = directory.path().join("config.json");
+        std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_synapse"))
+            .arg("--rebuild-search")
+            .arg("--config")
+            .arg(&config_path)
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        let events: Vec<Value> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .chain(String::from_utf8(output.stderr).unwrap().lines())
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        assert!(events.iter().any(|event| event.pointer("/error/code")
+            == Some(&serde_json::json!("search_rebuild_failed"))));
+        let statistics = events
+            .iter()
+            .find(|event| {
+                event.pointer("/log/message") == Some(&serde_json::json!("Search rebuild complete"))
+            })
+            .unwrap();
+        assert_eq!(
+            statistics.pointer("/log/indexed_count"),
+            Some(&serde_json::json!(1))
+        );
+        assert_eq!(
+            statistics.pointer("/log/failed_count"),
+            Some(&serde_json::json!(1))
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Fake embedding responder — deterministic vectors from input text
 // ---------------------------------------------------------------------------
@@ -576,8 +660,9 @@ async fn test_http_search_endpoint() {
 
     let app = synapse::create_router(state);
 
-    // GET /v1/search?q=HTTP+client&limit=3
+    // GET /synapse/search?q=HTTP+client&limit=3
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .uri("/synapse/search?q=HTTP+client&limit=3")
@@ -609,6 +694,35 @@ async fn test_http_search_endpoint() {
         assert!(r["name"].is_string());
         assert!(r["relevance"].is_number());
     }
+
+    let request_count = mock_server.received_requests().await.unwrap().len();
+    use base64::Engine;
+    let offset = usize::MAX.to_string();
+    for cursor in [
+        offset.clone(),
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(offset.as_bytes()),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/synapse/search?q=test&cursor={cursor}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400);
+        let body = axum::body::to_bytes(response.into_body(), 10000)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["code"], "cursor_invalid");
+    }
+    assert_eq!(
+        mock_server.received_requests().await.unwrap().len(),
+        request_count,
+    );
 }
 
 #[tokio::test]
